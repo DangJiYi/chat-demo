@@ -453,6 +453,8 @@ class App:
         self.balance_cache = {"at": 0, "data": None}
         self.sync_state = {"lastOk": 0, "lastTry": 0, "lastErr": "", "pulled": 0,
                            "cursor": 0, "peer": "", "enabled": False}
+        # 待确认的配对请求（像蓝牙那样：对方请求，本机点接受才生效）
+        self.pair_requests = []
         self.log_lock = threading.Lock()
     # --- 配置 / Key ---
     def config_path(self):
@@ -465,6 +467,9 @@ class App:
         cfg.setdefault("archiveDays", 7)
         cfg.setdefault("imageDays", 14)
         cfg.setdefault("deviceName", socket.gethostname())
+        cfg.setdefault("syncPort", self.sync_port)
+        if not 1024 <= int(cfg["syncPort"]) <= 65535:
+            cfg["syncPort"] = self.sync_port
         if cfg["intervalSec"] not in (3, 5, 10):
             cfg["intervalSec"] = 3
         if not 7 <= cfg["archiveDays"] <= 14:
@@ -677,8 +682,19 @@ class UIServer(Base):
         inbound_key = (self.headers.get("x-api-key") or "").strip()
         auth = (self.headers.get("Authorization") or "").strip()
         key = self.app.key
-        if key and (not inbound_key or inbound_key == SENTINEL or not auth
-                    or auth == "Bearer " + SENTINEL):
+        wants_server_key = (not inbound_key or inbound_key == SENTINEL or not auth
+                            or auth == "Bearer " + SENTINEL)
+        if wants_server_key:
+            if not key:
+                # 服务端没存 Key，却收到哨兵值。直接把 "__server__" 发给上游
+                # 会得到一个语焉不详的 401（“API Key 无效或已被删除”），
+                # 让人以为 Key 失效了，实际是没配置。这里明确告知。
+                self.send_json(400, {
+                    "error": "服务端尚未配置 API Key",
+                    "detail": "请先在设置里填入 Key（会保存在本机 data/meta/secret.json）",
+                    "code": "no_server_key",
+                })
+                return
             out_key, out_auth = key, "Bearer " + key
         else:
             out_key, out_auth = inbound_key, auth
@@ -888,7 +904,7 @@ class UIServer(Base):
             return True
 
         if path == "/pair" and method == "POST":
-            """一键配对：本机记下对端，同时请对端也记下本机，两边都不用再手填。"""
+            """发起配对：本机记下对端，并向对端的**同步端口**发送配对请求。"""
             payload = json.loads(self.read_body(1 << 16) or b"{}")
             ip = str(payload.get("ip") or "").strip()
             port = int(payload.get("port") or 8791)
@@ -897,35 +913,58 @@ class UIServer(Base):
                 return True
             result = {"peer": f"{ip}:{port}", "reverse": "skipped"}
             app.save_config({"peer": f"{ip}:{port}"})
-            # 反向：让对端也指向本机。失败不影响本机拉取。
+            # 反向：请对端也指向本机。对端只会入待确认队列，不会直接生效。
             mine = (local_ips() or [""])[0]
             if mine:
-                body = json.dumps({"ip": mine, "port": app.sync_port}).encode()
+                body = json.dumps({"ip": mine, "port": app.sync_port,
+                                   "name": app.config.get("deviceName", "")}).encode()
                 try:
                     import urllib.request
+                    # 注意：请求对端的**同步端口**（对端不知道我们的 UI 端口）
                     req = urllib.request.Request(
-                        f"http://{ip}:{port}/local/peer",
+                        f"http://{ip}:{port}/peer",
                         data=body, method="POST",
                         headers={"Content-Type": "application/json"})
-                    with urllib.request.urlopen(req, timeout=6):
-                        result["reverse"] = "ok"
+                    with urllib.request.urlopen(req, timeout=6) as resp:
+                        resp.read()
+                    result["reverse"] = "pending"
                 except Exception as exc:  # noqa: BLE001
                     result["reverse"] = f"failed: {exc}"
-            # 立即拉一次，界面上马上能看到数据
+            # 立即拉一次，本机马上能看到数据
             threading.Thread(target=pull_once, args=(app,), daemon=True).start()
             self.send_json(200, result)
             return True
 
-        if path == "/peer" and method == "POST":
-            """供对端反向设置用：别人配对时告诉我“该往哪拉”。"""
+        if path == "/pair/requests" and method == "GET":
+            with LOCK:
+                self.send_json(200, list(app.pair_requests))
+            return True
+
+        if path == "/pair/accept" and method == "POST":
+            """本机确认接受配对：才真正把 peer 写进配置。"""
             payload = json.loads(self.read_body(1 << 16) or b"{}")
             ip = str(payload.get("ip") or "").strip()
             port = int(payload.get("port") or 8791)
+            with LOCK:
+                app.pair_requests = [r for r in app.pair_requests
+                                     if not (r["ip"] == ip and r["port"] == port)]
             if not ip:
                 self.send_json(400, {"error": "缺少 ip"})
                 return True
             app.save_config({"peer": f"{ip}:{port}"})
+            app.log(f"已接受配对：{ip}:{port}")
+            threading.Thread(target=pull_once, args=(app,), daemon=True).start()
             self.send_json(200, {"peer": f"{ip}:{port}"})
+            return True
+
+        if path == "/pair/reject" and method == "POST":
+            payload = json.loads(self.read_body(1 << 16) or b"{}")
+            ip = str(payload.get("ip") or "").strip()
+            port = int(payload.get("port") or 8791)
+            with LOCK:
+                app.pair_requests = [r for r in app.pair_requests
+                                     if not (r["ip"] == ip and r["port"] == port)]
+            self.send_json(200, {"ok": True})
             return True
 
         if path == "/archived" and method == "GET":
@@ -1026,6 +1065,26 @@ class SyncServer(Base):
                 sessions.append(doc)
             files = [f for f in app.store.files() if f.get("createdAt", 0) > since]
             self.send_json(200, {"now": now_ms(), "sessions": sessions, "files": files})
+            return True
+        if path in ("/peer", "/local/peer") and method == "POST":
+            # 配对请求：**不直接改本机配置**，只入待确认队列。
+            # 对方只知道我们的同步端口 8791，不知道 UI 端口，所以必须在这里受理。
+            # 无鉴权地改配置 = 任人把你指向别人的服务器；改成请求-确认后，
+            # 实际生效要本机用户在界面上点「接受」（与蓝牙配对一致）。
+            payload = json.loads(self.read_body(1 << 16) or b"{}")
+            ip = str(payload.get("ip") or "").strip()
+            port = int(payload.get("port") or 8791)
+            if not ip:
+                self.send_json(400, {"error": "缺少 ip"})
+                return True
+            name = str(payload.get("name") or ip)[:64]
+            with LOCK:
+                app.pair_requests = [r for r in app.pair_requests
+                                     if not (r["ip"] == ip and r["port"] == port)]
+                app.pair_requests.append({"ip": ip, "port": port, "name": name,
+                                          "at": now_ms()})
+            app.log(f"收到配对请求：{name} ({ip}:{port})，等待确认")
+            self.send_json(200, {"pending": True})
             return True
         if path == "/sync/merge" and method == "POST":
             payload = json.loads(self.read_body(512 << 20) or b"{}")
@@ -1739,6 +1798,14 @@ def main(argv=None) -> None:
     parser.add_argument("--www", default=WWW)
     parser.add_argument("--no-window", action="store_true")
     args = parser.parse_args(argv)
+
+    # 同步端口允许在界面上改（存在 config.json 里）。命令行显式给了 --sync-port 就以命令行为准，
+    # 否则默认值 8791 表示“没指定”，沿用配置里的。
+    if args.sync_port == 8791:
+        pre = load_json(os.path.join(os.path.abspath(args.data), "meta", "config.json"), {}) or {}
+        saved = pre.get("syncPort")
+        if isinstance(saved, int) and 1024 <= saved <= 65535:
+            args.sync_port = saved
 
     WWW = os.path.abspath(args.www)
     app = App(os.path.abspath(args.data), args.port, args.sync_port)

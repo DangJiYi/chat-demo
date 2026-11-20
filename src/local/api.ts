@@ -104,6 +104,7 @@ export type LocalConfig = {
   archiveDays: number
   imageDays: number
   deviceName: string
+  syncPort: number
 }
 
 export type SyncStatus = {
@@ -177,9 +178,25 @@ export type DiscoverResponse = {
 export const discoverPeers = async (): Promise<DiscoverResponse> =>
   json<DiscoverResponse>(await fetch('/local/discover'))
 
-/** 一键配对：本机记下对端，并请求对端也记下本机 */
-export const pairPeer = (peer: DiscoveredPeer): Promise<{ peer: string; reverse: string }> =>
+/**
+ * 发起配对：本机指向对端，同时向对端发一条配对请求。
+ * 对端需要在本机界面上点「接受」才生效（避免任意人改你的配置）。
+ */
+export const pairPeer = (peer: { ip: string; port: number }): Promise<{ peer: string; reverse: string }> =>
   send('/pair', 'POST', { ip: peer.ip, port: peer.port })
+
+/** 待确认的配对请求（像蓝牙那样需要本机接受） */
+export type PairRequest = { ip: string; port: number; name: string; at: number }
+
+export const listPairRequests = async (): Promise<PairRequest[]> =>
+  json<PairRequest[]>(await fetch('/local/pair/requests'))
+
+/** 接受配对：此时才把对端写进本机配置 */
+export const acceptPair = (r: PairRequest): Promise<{ peer: string }> =>
+  send('/pair/accept', 'POST', { ip: r.ip, port: r.port })
+
+export const rejectPair = (r: PairRequest): Promise<unknown> =>
+  send('/pair/reject', 'POST', { ip: r.ip, port: r.port })
 
 export const getStorage = async (): Promise<StorageInfo> => json<StorageInfo>(await fetch('/local/storage'))
 

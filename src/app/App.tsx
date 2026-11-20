@@ -39,6 +39,7 @@ export const App = () => {
   const ready = useChatStore((state) => state.ready)
   const initError = useChatStore((state) => state.initError)
   const saveError = useChatStore((state) => Object.values(state.sessionSaveErrors).some(Boolean))
+  const lastSaveError = useChatStore((state) => state.lastSaveError)
   const importingHistory = useChatStore((state) => state.importingHistory)
   const session = useChatStore((state) =>
     state.activeId !== null && Object.hasOwn(state.sessionCache, state.activeId)
@@ -103,7 +104,10 @@ export const App = () => {
         <main className={styles.main}>
           {saveError ? (
             <div className={styles.saveError} role="alert">
-              <span>{t('sessionSaveFailed')}</span>
+              <span>
+                {t('sessionSaveFailed')}
+                {lastSaveError ? `（${lastSaveError}）` : ''}
+              </span>
               <Button
                 variant="outlined"
                 size="s"

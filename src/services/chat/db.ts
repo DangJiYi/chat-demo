@@ -20,7 +20,16 @@ const url = (path: string) => BASE + path
 const send = async (path: string, init?: RequestInit): Promise<Response> => {
   const response = await fetch(url(path), init)
   if (!response.ok && response.status !== 404) {
-    throw new Error(`${init?.method ?? 'GET'} ${path} 失败: ${response.status}`)
+    // 把服务端的错误内容带出来：否则只看到 500，不知道是哪个字段/权限出的问题
+    let detail = ''
+    try {
+      detail = (await response.text()).slice(0, 200)
+    } catch {
+      // 读不到就算了
+    }
+    throw new Error(
+      `${init?.method ?? 'GET'} ${path} 失败: ${response.status}${detail ? ` ${detail}` : ''}`
+    )
   }
   return response
 }

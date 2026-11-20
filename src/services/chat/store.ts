@@ -69,6 +69,8 @@ type ChatState = {
   sessionCache: Record<string, Session>
   sessionLoadErrors: Record<string, boolean>
   sessionSaveErrors: Record<string, boolean>
+  /** 最近一次保存失败的具体原因，显示在提示条里方便排查 */
+  lastSaveError: string
   /** null 表示新对话（欢迎页） */
   activeId: string | null
   /** 正在生成回复的会话 */
@@ -83,6 +85,7 @@ export const useChatStore = create<ChatState>(() => ({
   sessionCache: {},
   sessionLoadErrors: {},
   sessionSaveErrors: {},
+  lastSaveError: '',
   activeId: null,
   streaming: {},
 }))
@@ -212,6 +215,7 @@ const persist = (sessionId: string) => {
         if (epoch === historyEpoch && getSession(sessionId)) {
           set((state) => ({
             sessionSaveErrors: { ...state.sessionSaveErrors, [sessionId]: true },
+            lastSaveError: error instanceof Error ? error.message : String(error),
           }))
         }
       })

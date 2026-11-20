@@ -4,6 +4,7 @@ import { Button } from '../components/base/Button.js'
 import { showToast } from '../components/base/toastState.js'
 import { selectSession } from '../services/chat/store.js'
 import {
+  acceptPair,
   archiveNow,
   bytes,
   deleteSessions,
@@ -14,13 +15,16 @@ import {
   getSyncStatus,
   imagesNow,
   listArchived,
+  listPairRequests,
   pairPeer,
+  rejectPair,
   restoreSession,
   saveConfig,
   searchMessages,
   type ArchivedItem,
   type DiscoveredPeer,
   type LocalConfig,
+  type PairRequest,
   type SearchHit,
   type StorageInfo,
   type SyncStatus,
@@ -88,6 +92,11 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
   /** 搜索到的近邻设备 */
   const [found, setFound] = useState<DiscoveredPeer[] | null>(null)
   const [scanning, setScanning] = useState(false)
+  /** 本机名称 / 端口（可改） */
+  const [deviceName, setDeviceName] = useState('')
+  const [portDraft, setPortDraft] = useState('8791')
+  /** 待本机确认的配对请求 */
+  const [requests, setRequests] = useState<PairRequest[]>([])
 
   const [query, setQuery] = useState('')
   const [hits, setHits] = useState<SearchHit[] | null>(null)
@@ -98,19 +107,74 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
   const groups = useMemo(() => (hits ? groupHits(hits) : []), [hits])
   const allSelected = groups.length > 0 && groups.every((g) => selected.has(g.sessionId))
 
-  /** 复制本端地址：对端那台机器要填的就是它 */
+  /**
+   * 复制本端地址。
+   * WebView 里 navigator.clipboard 经常不可用（非安全上下文或缺权限），
+   * 所以退回隐藏 textarea + execCommand，再不行就选中文本让用户自己复制。
+   */
   const copyLocal = async () => {
-    if (!localIp) {
+    const text = localIp ? `${localIp}:${syncPort}` : ''
+    if (!text) {
+      showToast('还没获取到本端地址')
       return
     }
-    const text = `${localIp}:${syncPort}`
     try {
       await navigator.clipboard.writeText(text)
       showToast(`已复制本端地址 ${text}`)
+      return
+    } catch {
+      // 继续尝试兜底方式
+    }
+    try {
+      const area = document.createElement('textarea')
+      area.value = text
+      area.setAttribute('readonly', '')
+      area.style.position = 'fixed'
+      area.style.left = '-9999px'
+      document.body.appendChild(area)
+      area.select()
+      area.setSelectionRange(0, text.length)
+      const ok = document.execCommand('copy')
+      document.body.removeChild(area)
+      showToast(ok ? `已复制本端地址 ${text}` : `本端地址：${text}`)
     } catch {
       showToast(`本端地址：${text}`)
     }
   }
+
+  const saveName = () =>
+    void run('name', async () => {
+      const name = deviceName.trim()
+      if (!name) return '名称不能为空'
+      await saveConfig({ deviceName: name })
+      void refresh()
+      return `本机名称已改为「${name}」`
+    })
+
+  const saveSyncPort = () =>
+    void run('port', async () => {
+      const value = Number(portDraft)
+      if (!Number.isInteger(value) || value < 1024 || value > 65535) {
+        return '端口需在 1024–65535 之间'
+      }
+      await saveConfig({ syncPort: value })
+      void refresh()
+      return `同步端口已改为 ${value}，重启客户端后生效`
+    })
+
+  const accept = (r: PairRequest) =>
+    void run('accept', async () => {
+      await acceptPair(r)
+      void refresh()
+      return `已与 ${r.name} 配对`
+    })
+
+  const reject = (r: PairRequest) =>
+    void run('reject', async () => {
+      await rejectPair(r)
+      void refresh()
+      return '已拒绝该配对请求'
+    })
 
   /** 搜索局域网设备并一键配对（免手填两边 IP） */
   const scan = () =>
@@ -134,10 +198,10 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
       setHost(peer.ip)
       setPort(String(peer.port))
       void refresh()
-      if (res.reverse === 'ok') {
-        return `已与 ${peer.name} 配对，两边都配好了`
+      if (res.reverse === 'pending') {
+        return `已请求与 ${peer.name} 配对；请在对方设备上点「接受」`
       }
-      return `本机已指向 ${peer.name}；对端未确认（${res.reverse}），可能需在那台机器上再点一次`
+      return `本机已指向 ${peer.name}；未能通知对端（${res.reverse}）`
     })
 
   const refresh = async () => {
@@ -155,6 +219,8 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
       setArchived(ar)
       setLocalIp(dev.localIps?.[0] ?? '')
       setSyncPort(dev.syncPort ?? 8791)
+      setDeviceName(c.deviceName ?? '')
+      setPortDraft(String(dev.syncPort ?? 8791))
       const split = splitPeer(c.peer)
       setHost(split.host)
       setPort(split.port)
@@ -163,9 +229,21 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
     }
   }
 
+  const refreshRequests = async () => {
+    try {
+      setRequests(await listPairRequests())
+    } catch {
+      // 服务重启瞬间可能拿不到，忽略
+    }
+  }
+
   useEffect(() => {
     wrapRef.current?.scrollTo(0, 0)
     void refresh()
+    void refreshRequests()
+    // 对端配对请求是异步到达的，面板开着时定时看一眼
+    const timer = setInterval(() => void refreshRequests(), 4000)
+    return () => clearInterval(timer)
   }, [])
 
   const patch = async (next: Partial<LocalConfig>) => {
@@ -257,7 +335,29 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
       <div className={styles.wrap} ref={wrapRef}>
         {/* ---------- 同步 ---------- */}
         <section className={styles.section}>
-          <h3 className={styles.h}>同步</h3>
+          <h3 className={styles.h}>本机</h3>
+          <div className={styles.fieldRow}>
+            <label className={styles.field}>
+              <span className={styles.label}>名称</span>
+              <input
+                className={styles.input}
+                placeholder="这台设备的名称"
+                value={deviceName}
+                onChange={(e) => setDeviceName(e.target.value)}
+                onBlur={saveName}
+              />
+            </label>
+            <label className={`${styles.field} ${styles.narrow}`}>
+              <span className={styles.label}>同步端口</span>
+              <input
+                className={styles.input}
+                inputMode="numeric"
+                value={portDraft}
+                onChange={(e) => setPortDraft(e.target.value)}
+                onBlur={saveSyncPort}
+              />
+            </label>
+          </div>
           <div className={styles.fieldRow}>
             <label className={styles.field}>
               <span className={styles.label}>本端地址</span>
@@ -271,6 +371,10 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
               复制
             </Button>
           </div>
+        </section>
+
+        <section className={styles.section}>
+          <h3 className={styles.h}>同步</h3>
           <div className={styles.fieldRow}>
             <Button variant="outlined" onClick={scan} disabled={scanning}>
               {scanning ? '搜索中…' : '搜索附近设备'}
@@ -297,6 +401,24 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
                 ))}
               </div>
             )
+          ) : null}
+          {requests.length > 0 ? (
+            <div className={styles.peerList}>
+              {requests.map((r) => (
+                <div key={`${r.ip}:${r.port}`} className={styles.peerItem}>
+                  <span className={styles.peerName}>{r.name}</span>
+                  <span className={styles.peerAddr}>
+                    {r.ip}:{r.port}
+                  </span>
+                  <button type="button" className={styles.peerAction} onClick={() => accept(r)}>
+                    接受
+                  </button>
+                  <button type="button" className={styles.peerReject} onClick={() => reject(r)}>
+                    拒绝
+                  </button>
+                </div>
+              ))}
+            </div>
           ) : null}
           <div className={styles.fieldRow}>
             <label className={styles.field}>
