@@ -317,3 +317,51 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* 搜索到的近邻设备列表：点一行即配对 */
+.peerList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.peerItem {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.16));
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.peerItem:hover {
+  border-color: var(--dsw-alias-brand-primary, #4d6bfe);
+}
+
+.peerName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.peerAddr {
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary, #888);
+  font-variant-numeric: tabular-nums;
+}
+
+.peerAction {
+  font-size: 12px;
+  color: var(--dsw-alias-brand-primary, #4d6bfe);
+  white-space: nowrap;
+}

@@ -245,3 +245,122 @@
     line-height: 22px;
   }
 }
+
+/* ---- 本地加的多选模式 ---- */
+.top {
+  gap: 2px;
+}
+
+.selectRow {
+  width: 100%;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.selectRow:hover {
+  background: var(--dsw-alias-bg-layer-3, rgba(255, 255, 255, 0.06));
+}
+
+.checkOn,
+.checkOff {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  box-sizing: border-box;
+}
+
+.checkOff {
+  border: 1.5px solid var(--dsw-alias-border-l2, rgba(255, 255, 255, 0.3));
+}
+
+.checkOn {
+  border: 0;
+  background: var(--dsw-alias-brand-primary, #4d6bfe);
+  color: #fff;
+}
+
+.selectTitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selectBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+  flex-shrink: 0;
+}
+
+.selectAction {
+  flex: 1;
+  height: 32px;
+  border: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.14));
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary, #ddd);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.selectAction:hover:not(:disabled) {
+  background: var(--dsw-alias-bg-layer-3, rgba(255, 255, 255, 0.06));
+}
+
+.selectAction:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.selectDanger {
+  color: var(--dsw-alias-state-error-primary, #ff6b6b);
+  border-color: var(--dsw-alias-state-error-primary, rgba(255, 107, 107, 0.4));
+}
+
+/* 列表右上角的「多选」入口，鼠标移上去才明显 */
+.listWrap {
+  position: relative;
+}
+
+.sectionHeaderRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.selectEntry {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary, #888);
+  opacity: 0.55;
+  cursor: pointer;
+}
+
+.selectEntry:hover {
+  opacity: 1;
+  background: var(--dsw-alias-bg-layer-3, rgba(255, 255, 255, 0.08));
+  color: var(--dsw-alias-label-primary, #ddd);
+}

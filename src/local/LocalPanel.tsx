@@ -7,17 +7,19 @@ import {
   archiveNow,
   bytes,
   deleteSessions,
+  discoverPeers,
   getConfig,
   getDeviceStatus,
   getStorage,
   getSyncStatus,
   imagesNow,
   listArchived,
+  pairPeer,
   restoreSession,
   saveConfig,
   searchMessages,
-  syncNow,
   type ArchivedItem,
+  type DiscoveredPeer,
   type LocalConfig,
   type SearchHit,
   type StorageInfo,
@@ -83,6 +85,9 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
   /** 本机在局域网里的地址，填到对端那台机器的「对端 IP」里 */
   const [localIp, setLocalIp] = useState('')
   const [syncPort, setSyncPort] = useState(8791)
+  /** 搜索到的近邻设备 */
+  const [found, setFound] = useState<DiscoveredPeer[] | null>(null)
+  const [scanning, setScanning] = useState(false)
 
   const [query, setQuery] = useState('')
   const [hits, setHits] = useState<SearchHit[] | null>(null)
@@ -106,6 +111,34 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
       showToast(`本端地址：${text}`)
     }
   }
+
+  /** 搜索局域网设备并一键配对（免手填两边 IP） */
+  const scan = () =>
+    void run('scan', async () => {
+      setScanning(true)
+      try {
+        const res = await discoverPeers()
+        setFound(res.peers)
+        if (res.peers.length === 0) {
+          return '没找到其他设备：确认两台在同一局域网、对端也已开启客户端'
+        }
+        return `找到 ${res.peers.length} 台设备`
+      } finally {
+        setScanning(false)
+      }
+    })
+
+  const pair = (peer: DiscoveredPeer) =>
+    void run('pair', async () => {
+      const res = await pairPeer(peer)
+      setHost(peer.ip)
+      setPort(String(peer.port))
+      void refresh()
+      if (res.reverse === 'ok') {
+        return `已与 ${peer.name} 配对，两边都配好了`
+      }
+      return `本机已指向 ${peer.name}；对端未确认（${res.reverse}），可能需在那台机器上再点一次`
+    })
 
   const refresh = async () => {
     try {
@@ -238,6 +271,33 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
               复制
             </Button>
           </div>
+          <div className={styles.fieldRow}>
+            <Button variant="outlined" onClick={scan} disabled={scanning}>
+              {scanning ? '搜索中…' : '搜索附近设备'}
+            </Button>
+          </div>
+          {found !== null ? (
+            found.length === 0 ? (
+              <p className={styles.hint}>没找到其他设备，确认两台在同一局域网。</p>
+            ) : (
+              <div className={styles.peerList}>
+                {found.map((peer) => (
+                  <button
+                    key={`${peer.ip}:${peer.port}`}
+                    type="button"
+                    className={styles.peerItem}
+                    onClick={() => pair(peer)}
+                  >
+                    <span className={styles.peerName}>{peer.name}</span>
+                    <span className={styles.peerAddr}>
+                      {peer.ip}:{peer.port}
+                    </span>
+                    <span className={styles.peerAction}>配对</span>
+                  </button>
+                ))}
+              </div>
+            )
+          ) : null}
           <div className={styles.fieldRow}>
             <label className={styles.field}>
               <span className={styles.label}>对端 IP</span>

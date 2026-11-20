@@ -165,6 +165,22 @@ export const getDeviceStatus = async (): Promise<DeviceStatus> => json<DeviceSta
 
 export const syncNow = (): Promise<unknown> => send('/sync/now', 'POST', {})
 
+/** 局域网里可配对的另一台设备 */
+export type DiscoveredPeer = { name: string; ip: string; port: number }
+
+export type DiscoverResponse = {
+  peers: DiscoveredPeer[]
+  self: { name: string; ips: string[]; port: number }
+}
+
+/** 广播搜索局域网内的设备（服务端最多等 2 秒） */
+export const discoverPeers = async (): Promise<DiscoverResponse> =>
+  json<DiscoverResponse>(await fetch('/local/discover'))
+
+/** 一键配对：本机记下对端，并请求对端也记下本机 */
+export const pairPeer = (peer: DiscoveredPeer): Promise<{ peer: string; reverse: string }> =>
+  send('/pair', 'POST', { ip: peer.ip, port: peer.port })
+
 export const getStorage = async (): Promise<StorageInfo> => json<StorageInfo>(await fetch('/local/storage'))
 
 export const archiveNow = (): Promise<{ archived: number }> => send('/archive/now', 'POST', {})

@@ -456,6 +456,70 @@ export const selectSession = (id: string) => {
   }
 }
 
+/**
+ * 从磁盘重拉会话，把对端同步过来的内容带进界面。
+ *
+ * 同步是服务端后台做的（每 N 秒一次），前端并不知道什么时候有新数据；
+ * 不主动刷新就只能关掉再打开才看到。这里定时调：
+ *   - 摘要列表变了就更新侧边栏
+ *   - 当前打开的会话没在生成中就重读，否则会看不到对端补上的回答
+ *
+ * 不碰 updatedAt 相同的判断：对端补回答不会推进时间戳（见 server.py 的 SYNC_LOOKBACK_MS），
+ * 所以必须靠内容比较，不能靠时间戳。
+ */
+export const refreshSessions = async (): Promise<void> => {
+  const state = get()
+  if (!state.ready || state.importingHistory) {
+    return
+  }
+  const epoch = historyEpoch
+  let summaries: SessionSummary[]
+  try {
+    summaries = await db.loadSessionSummaries()
+  } catch {
+    return
+  }
+  if (epoch !== historyEpoch || get().importingHistory) {
+    return
+  }
+
+  const next = sortSessions(summaries)
+  const prev = get().sessions
+  const listChanged =
+    next.length !== prev.length || next.some((item, index) => !sameSummary(item, prev[index]))
+  if (listChanged) {
+    set({ sessions: next })
+  }
+
+  const activeId = get().activeId
+  if (!activeId || get().streaming[activeId] || deletingSessions.has(activeId)) {
+    return
+  }
+  const current = getSession(activeId)
+  if (!current) {
+    return
+  }
+  let stored
+  try {
+    stored = await db.loadSession(activeId)
+  } catch {
+    return
+  }
+  if (epoch !== historyEpoch || get().activeId !== activeId || !stored) {
+    return
+  }
+  const incoming = settleInterrupted(normalizeSession(stored))
+  // 内容完全一样就不要触发重渲染
+  if (JSON.stringify(incoming) === JSON.stringify(current)) {
+    return
+  }
+  // 本地可能刚编辑过还没落盘；磁盘版本消息更少时不覆盖
+  if (getVisibleMessages(incoming).length < getVisibleMessages(current).length) {
+    return
+  }
+  set((state) => ({ sessionCache: { ...state.sessionCache, [activeId]: incoming } }))
+}
+
 export const renameSession = (id: string, title: string) => {
   if (get().importingHistory || deletingSessions.has(id)) {
     return

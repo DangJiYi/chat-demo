@@ -5,6 +5,7 @@ import { useIsMobile, useMobileViewport, usePreventPageScroll } from './viewport
 import {
   bindChatPersistence,
   initChat,
+  refreshSessions,
   retrySaveSessions,
   selectSession,
   useChatStore,
@@ -16,6 +17,9 @@ import { MobileHeader } from '../components/session/MobileHeader.js'
 import { Welcome } from '../components/session/Welcome.js'
 import { ensureApiKey } from '../components/settings/settingsDialogState.js'
 import { SettingsDialog } from '../components/settings/SettingsDialog.js'
+import { LocalPanel } from '../local/LocalPanel.js'
+import { SearchOverlay } from '../local/SearchOverlay.js'
+import { closeLocalPanel, useLocalPanel } from '../local/localPanelState.js'
 import { Toast } from '../components/base/Toast.js'
 import { showToast } from '../components/base/toastState.js'
 import { onUploadNotice } from '../services/attachments.js'
@@ -71,6 +75,25 @@ export const App = () => {
     void initChat()
     // 首次打开先在设置里输入 API Key
     ensureApiKey()
+  }, [])
+
+  // 对端同步在服务端后台进行，前端定时拉一次，否则要关掉再打开才看到新消息。
+  // 只在页面可见时轮询，切后台就停，省电也省 CPU。
+  useEffect(() => {
+    const tick = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshSessions()
+      }
+    }
+    const timer = setInterval(tick, 5000)
+    const onVisible = () => tick()
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('focus', onVisible)
+    return () => {
+      clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('focus', onVisible)
+    }
   }, [])
 
   return (
@@ -133,7 +156,15 @@ export const App = () => {
         <SearchPanel />
       </div>
       <SettingsDialog />
+      <LocalPanelMount />
+      <SearchOverlay />
       <Toast />
     </>
   )
+}
+
+/** 侧边栏「本地与同步」弹窗的挂载点 */
+const LocalPanelMount = () => {
+  const open = useLocalPanel((state) => state.open)
+  return open ? <LocalPanel onClose={closeLocalPanel} /> : null
 }

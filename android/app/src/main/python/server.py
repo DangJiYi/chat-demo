@@ -73,6 +73,13 @@ LOCK = threading.RLock()
 # 用回看窗口 + 幂等合并解决，不依赖前端改时间戳。
 SYNC_LOOKBACK_MS = 15 * 60 * 1000
 
+# UDP 自动发现：不用手填对端 IP。
+# 一台广播，另一台应答，列表里点一下即完成配对（两边都配好）。
+# 只在局域网用，与同步端口 8791（本来就无鉴权）同属一个信任模型。
+DISCOVERY_PORT = 8792
+DISCOVER_MAGIC = b"DSH-CHAT-DISCOVER/1"
+DISCOVER_REPLY = b"DSH-CHAT-HERE/1"
+
 
 # ---------------------------------------------------------------- 小工具
 
@@ -447,7 +454,6 @@ class App:
         self.sync_state = {"lastOk": 0, "lastTry": 0, "lastErr": "", "pulled": 0,
                            "cursor": 0, "peer": "", "enabled": False}
         self.log_lock = threading.Lock()
-
     # --- 配置 / Key ---
     def config_path(self):
         return os.path.join(self.data_dir, "meta", "config.json")
@@ -872,6 +878,54 @@ class UIServer(Base):
             else:
                 threading.Thread(target=pull_once, args=(app,), daemon=True).start()
                 self.send_json(200, {"started": True})
+            return True
+
+        if path == "/discover" and method == "GET":
+            # 广播最多 2 秒；这里直接同步等，前端会看到短暂 loading
+            self.send_json(200, {"peers": discover_peers(app),
+                                 "self": {"name": app.config.get("deviceName", ""),
+                                          "ips": local_ips(), "port": app.sync_port}})
+            return True
+
+        if path == "/pair" and method == "POST":
+            """一键配对：本机记下对端，同时请对端也记下本机，两边都不用再手填。"""
+            payload = json.loads(self.read_body(1 << 16) or b"{}")
+            ip = str(payload.get("ip") or "").strip()
+            port = int(payload.get("port") or 8791)
+            if not ip:
+                self.send_json(400, {"error": "缺少 ip"})
+                return True
+            result = {"peer": f"{ip}:{port}", "reverse": "skipped"}
+            app.save_config({"peer": f"{ip}:{port}"})
+            # 反向：让对端也指向本机。失败不影响本机拉取。
+            mine = (local_ips() or [""])[0]
+            if mine:
+                body = json.dumps({"ip": mine, "port": app.sync_port}).encode()
+                try:
+                    import urllib.request
+                    req = urllib.request.Request(
+                        f"http://{ip}:{port}/local/peer",
+                        data=body, method="POST",
+                        headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=6):
+                        result["reverse"] = "ok"
+                except Exception as exc:  # noqa: BLE001
+                    result["reverse"] = f"failed: {exc}"
+            # 立即拉一次，界面上马上能看到数据
+            threading.Thread(target=pull_once, args=(app,), daemon=True).start()
+            self.send_json(200, result)
+            return True
+
+        if path == "/peer" and method == "POST":
+            """供对端反向设置用：别人配对时告诉我“该往哪拉”。"""
+            payload = json.loads(self.read_body(1 << 16) or b"{}")
+            ip = str(payload.get("ip") or "").strip()
+            port = int(payload.get("port") or 8791)
+            if not ip:
+                self.send_json(400, {"error": "缺少 ip"})
+                return True
+            app.save_config({"peer": f"{ip}:{port}"})
+            self.send_json(200, {"peer": f"{ip}:{port}"})
             return True
 
         if path == "/archived" and method == "GET":
@@ -1513,6 +1567,95 @@ def make_handler(app: App, kind: str):
     return type(f"Handler_{kind}", (cls,), {"app": app})
 
 
+# ---------------------------------------------------------------- 自动发现
+
+
+def _broadcast_targets() -> list:
+    """要广播的目标地址：受限广播 + 按本机网卡推算的子网广播。
+
+    只发 255.255.255.255 在部分安卓设备上会被丢弃，补上子网广播更可靠。
+    """
+    targets = ["255.255.255.255"]
+    for ip in local_ips():
+        parts = ip.split(".")
+        if len(parts) == 4:
+            targets.append(".".join(parts[:3] + ["255"]))
+    return targets
+
+
+def discover_peers(app: App, timeout: float = 2.0) -> list:
+    """广播询问局域网里还有谁，收集应答。
+
+    返回 [{"name", "ip", "port"}]，已去重。
+    """
+    found = {}
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(0.4)
+        payload = DISCOVER_MAGIC + b" " + json.dumps(
+            {"name": app.config.get("deviceName", socket.gethostname()),
+             "port": app.sync_port}).encode()
+        for target in _broadcast_targets():
+            try:
+                sock.sendto(payload, (target, DISCOVERY_PORT))
+            except OSError:
+                continue
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                data, addr = sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not data.startswith(DISCOVER_REPLY):
+                continue
+            try:
+                info = json.loads(data.split(b" ", 1)[1].decode("utf-8"))
+            except (ValueError, IndexError):
+                continue
+            port = int(info.get("port") or 8791)
+            ip = addr[0]
+            name = info.get("name") or ip
+            # 同一台机器会从多个网卡各回一次，按设备名去重，
+            # 否则列表里会出现两条同名设备（一个有线一个无线）。
+            key = name if name != ip else f"{ip}:{port}"
+            found.setdefault(key, {"name": name, "ip": ip, "port": port})
+    finally:
+        sock.close()
+    return list(found.values())
+
+
+def discovery_server(app: App) -> None:
+    """后台线程：监听发现广播并应答。绑定失败不致命（比如端口被占）。"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", DISCOVERY_PORT))
+        sock.settimeout(2.0)
+    except OSError as exc:
+        app.log(f"发现端口 {DISCOVERY_PORT} 不可用: {exc}")
+        return
+    app.log(f"自动发现已就绪 (UDP {DISCOVERY_PORT})")
+    name = app.config.get("deviceName") or socket.gethostname()
+    reply = DISCOVER_REPLY + b" " + json.dumps(
+        {"name": name, "port": app.sync_port}).encode()
+    while True:
+        try:
+            data, addr = sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        if not data.startswith(DISCOVER_MAGIC):
+            continue
+        try:
+            sock.sendto(reply, addr)
+        except OSError:
+            continue
+
+
 def tray_icon_path() -> str:
     """app.ico 的位置：打包后在 _MEIPASS，源码运行时在 server/ 里。"""
     return os.path.join(getattr(sys, "_MEIPASS", BASE_DIR), "app.ico")
@@ -1629,6 +1772,7 @@ def main(argv=None) -> None:
         app.log(f"同步端口 {args.sync_port} 不可用: {exc}")
 
     threading.Thread(target=sync_loop, args=(app,), daemon=True).start()
+    threading.Thread(target=discovery_server, args=(app,), daemon=True).start()
     threading.Thread(target=lambda: (time.sleep(30), archive_once(app)), daemon=True).start()
 
     url = f"http://127.0.0.1:{args.port}/"
