@@ -1435,7 +1435,26 @@ def start_tray(url: str, data_dir: str, app) -> object:
     return tray
 
 
-def main() -> None:
+def run_android(data_dir: str, www_dir: str, port: int = 8790) -> None:
+    """安卓壳的入口：显式参数，**不经过 sys.argv**。
+
+    为什么不设 sys.argv：Chaquopy 把 Java 的 String[] 转成 jarray，
+    它能索引、能取长度，但不是真正的 Python list。
+    argparse 内部会调 list.remove()，jarray 没有这个方法，直接抛
+    AttributeError: 'jarray' object has no attribute 'remove'。
+
+    这里收普通字符串（Java String -> Python str 是最基本的转换），
+    在 Python 侧拼成 list 再交给 main()。
+    """
+    main([
+        "--no-window",
+        "--data", str(data_dir),
+        "--www", str(www_dir),
+        "--port", str(port),
+    ])
+
+
+def main(argv=None) -> None:
     # 安卓上静态目录在 APK 里是只读的，由宿主先解压到私有目录再传进来
     global WWW
     # 打包成窗口程序（console=False）时 sys.stdout/stderr 是 None，print 会直接抛异常
@@ -1455,7 +1474,7 @@ def main() -> None:
     parser.add_argument("--data", default=os.path.join(HERE, "data"))
     parser.add_argument("--www", default=WWW)
     parser.add_argument("--no-window", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     WWW = os.path.abspath(args.www)
     app = App(os.path.abspath(args.data), args.port, args.sync_port)

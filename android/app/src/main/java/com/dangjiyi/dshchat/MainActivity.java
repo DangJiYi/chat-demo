@@ -382,26 +382,21 @@ public class MainActivity extends Activity {
             Python.start(new AndroidPlatform(getApplicationContext()));
         }
         Python py = Python.getInstance();
-
-        // server.py 的 main() 读 sys.argv，这里按命令行方式拼好。
-        // Chaquopy 会把 Java 数组转成 Python list，比手工 append 可靠。
-        PyObject sys = py.getModule("sys");
-        sys.put("argv", new String[]{
-                "server.py",
-                "--no-window",
-                "--data", dataDir().getAbsolutePath(),
-                "--www", wwwDir().getAbsolutePath(),
-                "--port", String.valueOf(PORT),
-        });
-
         PyObject server = py.getModule("server");
+
+        // 不要往 sys.argv 里塞 String[]：Chaquopy 把它转成 jarray，
+        // 不是真正的 list，argparse 内部调 list.remove() 会抛 AttributeError。
+        // server.run_android() 收普通字符串参数，在 Python 侧拼 argv。
+        final String dataPath = dataDir().getAbsolutePath();
+        final String wwwPath = wwwDir().getAbsolutePath();
+
         Thread t = new Thread(() -> {
             try {
                 // serve_forever 会一直阻塞，所以必须在后台线程里跑
-                server.callAttr("main");
+                server.callAttr("run_android", dataPath, wwwPath, PORT);
             } catch (Throwable e) {
                 pyError = Log.getStackTraceString(e);
-                Log.e(TAG, "server.main 退出", e);
+                Log.e(TAG, "server 退出", e);
             }
         }, "dsh-server");
         t.setDaemon(true);
