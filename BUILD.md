@@ -19,12 +19,23 @@ android/        Chaquopy 安卓壳（把 server.py + www 打进 APK）
 ```bash
 cd chat
 pnpm install --frozen-lockfile        # 首次
-rm -rf dist && NODE_ENV=production ./node_modules/.bin/rspack build -c rspack.config.ts
+rm -rf dist && DSH_LOCAL=1 NODE_ENV=production ./node_modules/.bin/rspack build -c rspack.config.ts
 rm -rf www && cp -r dist www
 ```
 
+**`DSH_LOCAL=1` 不能漏。** 它把 `apiOrigin` 置为空字符串，前端才会用同源相对路径
+（`/models`、`/anthropic/v1/...`），由 `server.py` 反向代理并注入服务端保存的 Key。
+漏了就会构建成直连 `https://api.deepseek.com`：前端把哨兵值 `__server__` 当 Key 发到上游，
+聊天永远 401「API Key 无效或已被删除」。
+
+检查方法（应为 0）：
+
+```bash
+grep -c "https://api.deepseek.com" www/static/js/main.*.js
+```
+
 **不要直接跑 `pnpm build`**：它的脚本里是 `rm -rf dist && NODE_ENV=production ...`，
-这是 POSIX 写法，在 cmd.exe 里两个都会失败。
+这是 POSIX 写法，在 cmd.exe 里两个都会失败，而且没有 `DSH_LOCAL`。
 
 ## 出 Windows 包
 

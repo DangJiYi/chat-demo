@@ -23,9 +23,20 @@ type ConfigOptions = {
   devServer?: Configuration['devServer']
 }
 
-/** 创建构建配置，支持自定义 API 地址和开发服务器选项 */
+/**
+ * 创建构建配置，支持自定义 API 地址和开发服务器选项。
+ *
+ * apiOrigin 决定前端往哪发请求：
+ *   - 空字符串：走同源相对路径（/models、/v1/、/anthropic/），
+ *     由本地 server.py 反向代理到 api.deepseek.com 并注入存在服务端的 Key。
+ *     **本地客户端（Windows exe / APK）必须用这个**。
+ *   - https://api.deepseek.com：直连上游，适合无后端的纯静态部署（GitHub Pages）。
+ *
+ * 之前本地构建误用了默认值（直连），前端把哨兵值 __server__ 当 Key 发到上游，
+ * 于是聊天永远 401「API Key 无效或已被删除」。用 DSH_LOCAL=1 构建可避免。
+ */
 export const createConfig = ({
-  apiOrigin = 'https://api.deepseek.com',
+  apiOrigin = process.env.DSH_LOCAL === '1' ? '' : 'https://api.deepseek.com',
   devServer,
 }: ConfigOptions = {}): Configuration => ({
   mode: dev ? 'development' : 'production',
