@@ -15,9 +15,9 @@ import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 
-import com.chaquopy.python.PyObject;
-import com.chaquopy.python.Python;
-import com.chaquopy.python.android.AndroidPlatform;
+import com.chaquo.python.PyObject;
+import com.chaquo.python.Python;
+import com.chaquo.python.android.AndroidPlatform;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -46,6 +46,8 @@ public class MainActivity extends Activity {
 
     private WebView webView;
     private TextView errorView;
+    // Python 解释器和 server 线程是进程级的；Activity 重建时不能重复启动
+    private static volatile boolean sBooted = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -80,8 +82,14 @@ public class MainActivity extends Activity {
     private void boot() {
         try {
             extractAssets();
-            startPython();
-            waitForServer(BOOT_TIMEOUT_MS);
+            if (sBooted) {
+                // 服务已经在跑（Activity 重建），直接等它就绪即可
+                waitForServer(BOOT_TIMEOUT_MS);
+            } else {
+                startPython();
+                waitForServer(BOOT_TIMEOUT_MS);
+                sBooted = true;
+            }
             runOnUiThread(() -> webView.loadUrl("http://" + HOST + ":" + PORT + "/"));
         } catch (Throwable t) {
             Log.e(TAG, "启动失败", t);
@@ -141,6 +149,9 @@ public class MainActivity extends Activity {
     /**
      * 递归复制 assets。AssetManager 对「空目录」和「文件」都返回空数组，本项目没有空目录，
      * 所以用「list 非空即目录」判断足够。
+     *
+     * 注意：Chaquopy 会把自己的运行时放在 assets/chaquopy/（app.zip + stdlib），
+     * 这些不能当成前端资源抄进 www/，否则白拷几十 MB。
      */
     private void copyAssetDir(String path, File outDir) throws IOException {
         AssetManager am = getAssets();
@@ -149,6 +160,9 @@ public class MainActivity extends Activity {
             return;
         }
         for (String name : children) {
+            if (path.isEmpty() && "chaquopy".equals(name)) {
+                continue;
+            }
             String childPath = path.isEmpty() ? name : path + "/" + name;
             String[] grand = am.list(childPath);
             File out = new File(outDir, name);
@@ -219,18 +233,16 @@ public class MainActivity extends Activity {
         }
         Python py = Python.getInstance();
 
-        // server.py 的 main() 读 sys.argv，这里按命令行方式拼好
+        // server.py 的 main() 读 sys.argv，这里按命令行方式拼好。
+        // Chaquopy 会把 Java 数组转成 Python list，比手工 append 可靠。
         PyObject sys = py.getModule("sys");
-        PyObject argv = py.getModule("builtins").callAttr("list");
-        argv.callAttr("append", "server.py");
-        argv.callAttr("append", "--no-window");
-        argv.callAttr("append", "--data");
-        argv.callAttr("append", dataDir().getAbsolutePath());
-        argv.callAttr("append", "--www");
-        argv.callAttr("append", wwwDir().getAbsolutePath());
-        argv.callAttr("append", "--port");
-        argv.callAttr("append", String.valueOf(PORT));
-        sys.put("argv", argv);
+        sys.put("argv", new String[]{
+                "server.py",
+                "--no-window",
+                "--data", dataDir().getAbsolutePath(),
+                "--www", wwwDir().getAbsolutePath(),
+                "--port", String.valueOf(PORT),
+        });
 
         PyObject server = py.getModule("server");
         Thread t = new Thread(() -> {

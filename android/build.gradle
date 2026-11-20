@@ -1,4 +1,19 @@
-plugins {
-    id 'com.android.application' version '8.5.2' apply false
-    id 'com.chaquopy.python' version '16.0.0' apply false
+// 用 buildscript + classpath 而不是 plugins DSL：
+// Maven 坐标 com.chaquo.python:gradle 是官方文档一直用的，比插件 ID 更确定。
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.5.2'
+        classpath 'com.chaquo.python:gradle:16.0.0'
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
 }

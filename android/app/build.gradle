@@ -1,7 +1,5 @@
-plugins {
-    id 'com.android.application'
-    id 'com.chaquopy.python'
-}
+apply plugin: 'com.android.application'
+apply plugin: 'com.chaquo.python'
 
 android {
     namespace 'com.dangjiyi.dshchat'
@@ -25,14 +23,14 @@ android {
         main {
             // Python 源码：仓库根的 server/（server.py）
             python.srcDir '../../server'
-            // 前端静态站：仓库根的 www/，打包进 assets，首次启动解压到私有目录
-            assets.srcDirs += ['../../www']
+            // 前端静态站：内容平铺进 assets 根，运行时由 MainActivity 复制到私有目录
+            assets.srcDir '../../www'
         }
     }
 
     buildTypes {
         debug {
-            // 个人自用，debug 签名足够；产物不过期，可直接安装
+            // 个人自用，debug 签名足够
         }
         release {
             minifyEnabled false
@@ -44,16 +42,18 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
-
-    packagingOptions {
-        jniLibs {
-            useLegacyPackaging false
-        }
-    }
 }
 
+// server.py 只用标准库，没有 pip 依赖，所以不需要 buildPython 去编译 wheel。
+// 但 Chaquopy 在配置阶段仍会检查这个字段，这里按平台挑一个存在的解释器。
+def buildPy = System.getenv('CHAQUOPY_BUILD_PYTHON')
+if (!buildPy) {
+    def candidates = ['/usr/bin/python3', '/usr/local/bin/python3']
+    def found = candidates.find { new File(it).exists() }
+    buildPy = found ?: 'python'
+}
 python {
-    // server.py 只用标准库，没有任何 pip 依赖
+    buildPython buildPy
 }
 
 dependencies {

@@ -1,8 +1,10 @@
 name: Deploy GitHub Pages
 
 on:
-  push:
-    branches: [main]
+  # 原先 push 到 main 就部署 Pages，但仓库没有启用 Pages site，
+  # 每次推送都会失败。打包用不到它，改成只能手动触发。
+  # 想要站点：仓库 Settings -> Pages -> Source 选 "GitHub Actions"，
+  # 再把下面两行换回 push: branches: [main]。
   workflow_dispatch:
 
 permissions:
