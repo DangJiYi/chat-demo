@@ -7,7 +7,7 @@
 # 白名单只放一条：DangJiYi/chat-demo（你自己的 fork）。
 # 想加别的目标，改下面那个 case 分支——那是刻意的摩擦，别绕过它。
 
-ALLOWED_OWNER=DanJiYi
+ALLOWED_OWNER=DangJiYi
 ALLOWED_REPO=chat-demo
 
 remote_name="$1"
