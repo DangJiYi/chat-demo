@@ -683,13 +683,22 @@ class UIServer(Base):
         inbound_key = (self.headers.get("x-api-key") or "").strip()
         auth = (self.headers.get("Authorization") or "").strip()
         key = self.app.key
-        wants_server_key = (not inbound_key or inbound_key == SENTINEL or not auth
-                            or auth == "Bearer " + SENTINEL)
-        if wants_server_key:
+
+        # 先把来自浏览器的真实凭据筛出来（哨兵值和空值都不算凭据）。
+        in_key = "" if inbound_key == SENTINEL else inbound_key
+        in_auth = "" if auth == "Bearer " + SENTINEL else auth
+
+        if in_key or in_auth:
+            # 前端带了真凭据就用它。这一支很关键：
+            # verifyApiKey() 只带 Authorization、不带 x-api-key，
+            # 若按“任一为空就用服务端 Key”判定，验证新 Key 时会被旧 Key 顶替，
+            # 结果永远验证不过 —— 用户想换 Key 也换不掉。
+            out_key, out_auth = in_key, in_auth
+        else:
+            # 没带凭据（或只有哨兵）：用服务端保存的 Key。
             if not key:
-                # 服务端没存 Key，却收到哨兵值。直接把 "__server__" 发给上游
-                # 会得到一个语焉不详的 401（“API Key 无效或已被删除”），
-                # 让人以为 Key 失效了，实际是没配置。这里明确告知。
+                # 直接把 "__server__" 发给上游会得到一个语焉不详的 401
+                # （“API Key 无效或已被删除”），让人以为 Key 失效了，实际是没配置。
                 self.send_json(400, {
                     "error": "服务端尚未配置 API Key",
                     "detail": "请先在设置里填入 Key（会保存在本机 data/meta/secret.json）",
@@ -697,8 +706,6 @@ class UIServer(Base):
                 })
                 return
             out_key, out_auth = key, "Bearer " + key
-        else:
-            out_key, out_auth = inbound_key, auth
 
         conn = http.client.HTTPSConnection(UPSTREAM, timeout=600,
                                            context=ssl.create_default_context())
