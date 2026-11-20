@@ -18,7 +18,12 @@ pip install pyinstaller
 pyinstaller --noconfirm dsh-chat.spec
 ```
 
-产物在 `server/dist/dsh-chat/`，双击 `dsh-chat.exe` 即启动。
+产物是**单个文件** `server/dist/dsh-chat.exe`（没有 `_internal` 目录，不需要压缩包），
+拷到哪都能双击运行，数据目录建在 exe 旁边。
+
+用的是 PyInstaller 的 onefile 模式。代价是**冷启动慢 1-3 秒**（每次启动都要把
+运行时和 `www/` 解压到临时目录）；好处是分发只有一个 exe，不会出现
+「只拷了 exe 忘了带 _internal」这种故障。
 
 ### 托盘程序（没有黑色控制台）
 
