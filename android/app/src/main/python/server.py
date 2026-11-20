@@ -1368,9 +1368,57 @@ def make_handler(app: App, kind: str):
     return type(f"Handler_{kind}", (cls,), {"app": app})
 
 
+def tray_icon_path() -> str:
+    """app.ico 的位置：打包后在 _MEIPASS，源码运行时在 server/ 里。"""
+    return os.path.join(getattr(sys, "_MEIPASS", BASE_DIR), "app.ico")
+
+
+def start_tray(url: str, data_dir: str, app) -> object:
+    """Windows 上启动托盘图标。失败返回 None，调用方退回“直接开浏览器”。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        from tray import TrayIcon, hide_console
+    except Exception as exc:  # noqa: BLE001
+        app.log(f"托盘模块不可用: {exc!r}")
+        return None
+
+    # 打包成窗口程序后不该再有控制台；即便有，也藏起来
+    if FROZEN:
+        try:
+            hide_console()
+        except Exception:  # noqa: BLE001
+            pass
+
+    icon = tray_icon_path()
+    tray = TrayIcon(
+        f"dsh-chat {VERSION}",
+        icon if os.path.isfile(icon) else None,
+        on_open=lambda: open_window(url),
+        on_data=lambda: open_window(data_dir),
+        on_exit=lambda: os._exit(0),
+    )
+    tray.start()
+    # 等图标真正建好再返回：失败时宁可退回开浏览器，也不要留个看不见的程序
+    for _ in range(40):
+        if tray.ok or tray.error is not None:
+            break
+        time.sleep(0.05)
+    if not tray.ok:
+        app.log(f"托盘创建失败: {tray.error!r}")
+        return None
+    app.log("托盘图标已就绪")
+    return tray
+
+
 def main() -> None:
     # 安卓上静态目录在 APK 里是只读的，由宿主先解压到私有目录再传进来
     global WWW
+    # 打包成窗口程序（console=False）时 sys.stdout/stderr 是 None，print 会直接抛异常
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1410,7 +1458,13 @@ def main() -> None:
     app.log(f"dsh-chat {VERSION} 就绪 {url} (数据目录 {app.data_dir})")
     app.log(f"静态目录 {WWW} (index.html {'存在' if os.path.isfile(os.path.join(WWW, 'index.html')) else '缺失'})")
     if not args.no_window:
-        threading.Timer(0.6, lambda: open_window(url)).start()
+        tray = start_tray(url, app.data_dir, app)
+        if tray is not None:
+            # 首次使用还没填 Key 时自动开一次，否则用户对着托盘图标不知从哪进
+            if not app.key:
+                threading.Timer(0.3, lambda: open_window(url)).start()
+        else:
+            threading.Timer(0.6, lambda: open_window(url)).start()
 
     try:
         ui.serve_forever()
@@ -1431,9 +1485,11 @@ def _crash_hook(exc_type, exc, tb):
     except OSError:
         pass
     print(text)
+    # 窗口模式下没有 stdin，input() 会抛 RuntimeError
     try:
-        input("按回车退出…")
-    except EOFError:
+        if sys.stdin is not None and getattr(sys.stdin, "isatty", lambda: False)():
+            input("按回车退出…")
+    except (EOFError, RuntimeError):
         pass
 
 

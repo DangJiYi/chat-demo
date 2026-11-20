@@ -18,7 +18,23 @@ pip install pyinstaller
 pyinstaller --noconfirm dsh-chat.spec
 ```
 
-产物在 `server/dist/dsh-chat/`，双击 `dsh-chat.exe` 即启动（会自己开浏览器）。
+产物在 `server/dist/dsh-chat/`，双击 `dsh-chat.exe` 即启动。
+
+### 托盘程序（没有黑色控制台）
+
+spec 里是 `console=False`，所以 exe 不再弹控制台，而是常驻**系统托盘**：
+
+- **左键单击 / 双击图标**：打开界面
+- **右键菜单**：打开界面 / 打开数据目录 / 退出
+
+首次运行还没填 API Key 时会自动打开一次浏览器，否则你对着图标不知道从哪进。
+之后就是托盘常驻、需要时再开。
+
+托盘实现在 `server/tray.py`，**纯 ctypes 调 Win32，不引入任何第三方包**（pystray/Pillow 都不需要）。
+图标是 `server/app.ico`，由纯标准库生成的（十六进制结构合法、4 个尺寸），
+加载失败时会退回系统默认图标。
+
+`--no-window` 仍然有效：加它就不起托盘、不开浏览器，适合当纯后台服务跑。
 
 ## 出安卓包
 
@@ -70,20 +86,19 @@ cd android && gradle assembleDebug
    `--no-window --data <filesDir>/data --www <filesDir>/www --port 8790`。
 3. 轮询 `/local/status`，就绪后用 WebView 加载 `http://127.0.0.1:8790/`。
 
-### 目录约定（注意重复）
+### 目录约定
 
-`server.py` 在仓库里有两份：
+`server.py` 的**唯一源头**是 `server/server.py`。
 
-```text
-server/server.py                          Windows 打包用
-android/app/src/main/python/server.py     Chaquopy 用（默认源码目录）
-```
+Chaquopy 只认 `app/src/main/python/`，所以 `android/app/build.gradle` 里注册了一个
+`syncServerPy` 任务，在 `preBuild` 之前自动把 `server/server.py` 复制过去。
+本地和 CI 走同一条路，不存在两处手改。
 
-Chaquopy 默认只认 `app/src/main/python/`，为了不引入额外配置（少一个出错点），
-这里直接放一份副本。**改 `server.py` 时必须同步两份**——CI 的 android job 里有一个
-`diff` 步骤会检查，不一致会直接失败。
+仓库里仍然保留着一份 `android/app/src/main/python/server.py`（方便不跑 Gradle 时也能直接看），
+CI 里有一个 `diff` 步骤确认它和源头一致——不一致会直接失败。
+**改了 `server/server.py` 后，重新跑一次 Gradle 或手动复制这份即可。**
 
-同样地 `android/app/build.gradle` 里没有 `python { }` 块：`server.py` 只用标准库，
+`android/app/build.gradle` 里没有 `python { }` 块：`server.py` 只用标准库，
 没有 pip 依赖，`buildPython` 用 Chaquopy 的默认值即可。
 
 ### 几个已知点

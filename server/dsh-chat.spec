@@ -4,20 +4,26 @@
 用法（在 server/ 目录下）：
     pyinstaller --noconfirm dsh-chat.spec
 
-产物：dist/dsh-chat/（onedir，双击 dsh-chat.exe 即启动）。
-www/ 和 server.py 是兄弟目录，所以这里用 SPECPATH 定位，避免依赖工作目录。
+产物：dist/dsh-chat/（onedir，双击 dsh-chat.exe 启动，常驻系统托盘）。
 """
 
 import os
 
 HERE = os.path.abspath(SPECPATH)
+WWW = os.path.join(HERE, os.pardir, "www")
+ICON = os.path.join(HERE, "app.ico")
 
 a = Analysis(
     [os.path.join(HERE, "server.py")],
     pathex=[HERE],
     binaries=[],
-    # (源路径, 打包后的相对路径)；www 是前端静态站，必须随包走
-    datas=[(os.path.join(HERE, os.pardir, "www"), "www")],
+    # (源路径, 打包后的相对路径)
+    #   www    前端静态站，必须随包走
+    #   app.ico 托盘和 exe 的图标；运行时从 _MEIPASS 读
+    datas=[
+        (WWW, "www"),
+        (ICON, "."),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -38,12 +44,14 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=True,
+    # 窗口程序：不弹黑色控制台，程序常驻托盘
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=ICON,
 )
 coll = COLLECT(
     exe,

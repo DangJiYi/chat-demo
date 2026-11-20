@@ -3,6 +3,16 @@ plugins {
     id 'com.chaquo.python'
 }
 
+// server.py 只有一份源（仓库根的 server/server.py）。
+// Chaquopy 只认 app/src/main/python/，所以构建前自动复制过去，
+// 本地和 CI 走同一条路，不会出现两份漂移。
+// tray.py 是 Windows 专用（Android 上 start_tray 直接返回 None，不会 import），所以不复制。
+tasks.register('syncServerPy', Copy) {
+    from '../../server/server.py'
+    into 'src/main/python'
+}
+preBuild.dependsOn syncServerPy
+
 android {
     namespace 'com.dangjiyi.dshchat'
     compileSdk 34
@@ -24,7 +34,7 @@ android {
     sourceSets {
         main {
             // 前端静态站平铺进 assets 根；MainActivity 启动时复制到私有目录
-            // Python 源码用 Chaquopy 的默认位置 src/main/python（server.py 已放在那里）
+            // Python 源码用 Chaquopy 的默认位置 src/main/python（由 syncServerPy 生成）
             assets.srcDir '../../www'
         }
     }
