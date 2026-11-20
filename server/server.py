@@ -25,12 +25,10 @@ import shutil
 import socket
 import socketserver
 import ssl
-import subprocess
 import sys
 import threading
 import time
 import urllib.parse
-import webbrowser
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1375,13 +1373,18 @@ def open_window(url: str) -> None:
 
     走 explorer.exe：它固定在普通权限下运行，能避免从提权进程里把浏览器也拉成管理员实例
     （那会弹"现有实例正在以提升的权限运行"）。explorer 不可用时再退回 ShellExecute。
+
+    subprocess / webbrowser 在这里才导入：安卓壳用 --no-window，永远走不到这里，
+    放在模块顶部只会增加 "导入 server.py 就失败" 的面。
     """
+    import subprocess
     try:
         subprocess.Popen(["explorer.exe", url])
         return
     except OSError as exc:
         print(f"explorer 打开失败({exc})，改用系统默认方式")
     try:
+        import webbrowser
         webbrowser.open(url)
     except Exception as exc:  # noqa: BLE001
         print(f"打开浏览器失败({exc})，请手动访问 {url}")
