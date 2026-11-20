@@ -93,18 +93,30 @@ cd android && gradle assembleDebug
 
 ### 目录约定
 
-`server.py` 的**唯一源头**是 `server/server.py`。
+`server.py` 在仓库里有两份，内容必须完全一致：
 
-Chaquopy 只认 `app/src/main/python/`，所以 `android/app/build.gradle` 里注册了一个
-`syncServerPy` 任务，在 `preBuild` 之前自动把 `server/server.py` 复制过去。
-本地和 CI 走同一条路，不存在两处手改。
+```text
+server/server.py                          Windows 打包用（PyInstaller）
+android/app/src/main/python/server.py     Chaquopy 只认这个默认目录
+```
 
-仓库里仍然保留着一份 `android/app/src/main/python/server.py`（方便不跑 Gradle 时也能直接看），
-CI 里有一个 `diff` 步骤确认它和源头一致——不一致会直接失败。
-**改了 `server/server.py` 后，重新跑一次 Gradle 或手动复制这份即可。**
+**为什么不在构建时自动复制**：试过用 Gradle 的 `syncServerPy` 任务在 `preBuild` 前复制，
+但 `src/main/python` 会同时成为该任务的输出和 Chaquopy 的输入，Gradle 判定为隐式依赖
+并直接拒绝构建（`implicit_dependency`）。所以保留两份提交，用 CI 的 `diff` 步骤防漂移。
+
+**改了 `server/server.py` 后，记得同步 Android 那份：**
+
+```bash
+cp server/server.py android/app/src/main/python/server.py
+```
+
+漏了会怎样：CI 的 `Check server.py copies are in sync` 步骤直接失败，不会静默放过。
 
 `android/app/build.gradle` 里没有 `python { }` 块：`server.py` 只用标准库，
 没有 pip 依赖，`buildPython` 用 Chaquopy 的默认值即可。
+
+`server/tray.py` 不需要同步——它只在 Windows 上用。Android 上 `start_tray()`
+在 `sys.platform != "win32"` 时直接返回 `None`，不会去 import 它。
 
 ### 几个已知点
 

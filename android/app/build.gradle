@@ -3,15 +3,11 @@ plugins {
     id 'com.chaquo.python'
 }
 
-// server.py 只有一份源（仓库根的 server/server.py）。
-// Chaquopy 只认 app/src/main/python/，所以构建前自动复制过去，
-// 本地和 CI 走同一条路，不会出现两份漂移。
-// tray.py 是 Windows 专用（Android 上 start_tray 直接返回 None，不会 import），所以不复制。
-tasks.register('syncServerPy', Copy) {
-    from '../../server/server.py'
-    into 'src/main/python'
-}
-preBuild.dependsOn syncServerPy
+// Python 源码放在 Chaquopy 的默认目录 src/main/python/server.py。
+//
+// 不在这里做"构建时从 server/ 复制"：syncServerPy 会把 src/main/python 同时作为
+// 任务输出和 Chaquopy 的输入，Gradle 判定为隐式依赖并直接拒绝构建。
+// 两份副本的一致性由 CI 的 diff 步骤保证（不同步会直接失败）。
 
 android {
     namespace 'com.dangjiyi.dshchat'
@@ -34,7 +30,7 @@ android {
     sourceSets {
         main {
             // 前端静态站平铺进 assets 根；MainActivity 启动时复制到私有目录
-            // Python 源码用 Chaquopy 的默认位置 src/main/python（由 syncServerPy 生成）
+            // Python 源码在默认位置 src/main/python（见文件顶部说明）
             assets.srcDir '../../www'
         }
     }
