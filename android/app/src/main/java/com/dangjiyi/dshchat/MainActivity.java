@@ -57,6 +57,8 @@ public class MainActivity extends Activity {
 
     private WebView webView;
     private TextView errorView;
+    // 盖在 WebView 上面的诊断遮罩；成功加载后必须整个隐藏，否则会吃掉所有触摸
+    private ScrollView overlay;
     private final StringBuilder diag = new StringBuilder();
     // Python 服务启动时的异常/日志，失败时展示到界面上
     private volatile String pyError = null;
@@ -72,10 +74,12 @@ public class MainActivity extends Activity {
         errorView = new TextView(this);
         root.addView(webView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        // 诊断面板可滚动，白屏时能看清到底哪里出错
-        ScrollView scroller = new ScrollView(this);
-        scroller.addView(errorView);
-        root.addView(scroller, new FrameLayout.LayoutParams(
+        // 诊断面板可滚动，白屏时能看清到底哪里出错。
+        // 必须提升为字段：它是全屏盖在 WebView 上的，遮罩时必须整个 GONE 掉，
+        // 只藏里面的 TextView 不够 —— ScrollView 仍会拦截触摸，导致界面点不动。
+        overlay = new ScrollView(this);
+        overlay.addView(errorView);
+        root.addView(overlay, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         errorView.setVisibility(View.VISIBLE);
         errorView.setPadding(40, 80, 40, 40);
@@ -92,7 +96,6 @@ public class MainActivity extends Activity {
         settings.setAllowFileAccess(false);
         settings.setAllowContentAccess(false);
         settings.setMediaPlaybackRequiresUserGesture(false);
-        webView.setWebViewClient(new WebViewClient());
         webView.setBackgroundColor(Color.WHITE);
 
         // 关键：没有这些回调，加载失败就只是一片白，什么都看不到
@@ -118,23 +121,9 @@ public class MainActivity extends Activity {
 
             @Override
             public void onPageFinished(WebView view, String url) {
-                // 页面跑完了但 #root 里没东西，就是 JS 没渲染出来
-                view.evaluateJavascript(
-                        "(function(){var r=document.getElementById('root');"
-                      + "return JSON.stringify({root:r?r.childElementCount:-1,"
-                      + "body:document.body?document.body.innerText.length:0});})()",
-                        value -> {
-                            if (value != null && value.contains("\"root\":0")) {
-                                showDiag("页面已加载，但界面没有渲染出来。\n\n"
-                                        + "这通常意味着 JS 执行出错。\n"
-                                        + "请查看下方日志，或运行：\n"
-                                        + "adb logcat -s dsh-chat\n\n" + diag);
-                            } else {
-                                // 渲染成功，把启动提示遮罩拿掉
-                                errorView.setVisibility(View.GONE);
-                                webView.setVisibility(View.VISIBLE);
-                            }
-                        });
+                // 延迟再检查：#root 是 React 挂载的，onPageFinished 可能早于首次渲染。
+                // 太早检查会把“还没渲染”误判成“渲染失败”。
+                view.postDelayed(() -> probeRendered(view), 800);
             }
         });
 
@@ -205,6 +194,9 @@ public class MainActivity extends Activity {
         Log.e(TAG, text);
         runOnUiThread(() -> {
             webView.setVisibility(View.GONE);
+            if (overlay != null) {
+                overlay.setVisibility(View.VISIBLE);
+            }
             errorView.setVisibility(View.VISIBLE);
             errorView.setText(text);
         });
@@ -235,6 +227,40 @@ public class MainActivity extends Activity {
         } catch (IOException e) {
             return "(读取失败: " + e + ")";
         }
+    }
+
+    /**
+     * 检查 #root 是否真的渲染出内容：
+     *   有子节点 -> 隐藏整个遮罩（含 ScrollView），让 WebView 接管触摸
+     *   为空     -> 显示诊断，并保留遮罩
+     */
+    private void probeRendered(WebView view) {
+        view.evaluateJavascript(
+                "(function(){var r=document.getElementById('root');"
+              + "return JSON.stringify({root:r?r.childElementCount:-1,"
+              + "body:document.body?document.body.innerText.length:0});})()",
+                value -> {
+                    boolean empty = value == null || value.contains("\"root\":0");
+                    if (empty) {
+                        showDiag("页面已加载，但界面没有渲染出来。\n\n"
+                                + "这通常意味着 JS 执行出错。\n"
+                                + "请查看下方日志，或运行：\n"
+                                + "adb logcat -s dsh-chat\n\n" + diag);
+                        return;
+                    }
+                    Log.i(TAG, "界面已渲染，移除遮罩: " + value);
+                    hideOverlay();
+                });
+    }
+
+    /** 隐藏整个诊断遮罩。必须连 ScrollView 一起隐藏，否则它仍会拦截触摸。 */
+    private void hideOverlay() {
+        runOnUiThread(() -> {
+            if (overlay != null) {
+                overlay.setVisibility(View.GONE);
+            }
+            webView.setVisibility(View.VISIBLE);
+        });
     }
 
     /** 显示完整诊断信息（含已收集的 console 日志）。必须在 UI 线程调用。 */
