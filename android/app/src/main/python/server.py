@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import socket
+import socketserver
 import ssl
 import subprocess
 import sys
@@ -500,6 +501,19 @@ def json_bytes(obj) -> bytes:
 
 class QuietServer(ThreadingHTTPServer):
     daemon_threads = True
+
+    def server_bind(self):
+        """跳过 HTTPServer.server_bind 里的 socket.getfqdn(host)。
+
+        标准实现会做一次反查：self.server_name = socket.getfqdn(host)。
+        在 Android 上这一步可能触发 DNS 查询并阻塞几十秒，
+        表现就是“服务迟迟不监听” —— 外层只能看到启动超时。
+        server_name 只用于 CGI 等场景，我们不需要，直接用地址即可。
+        """
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
     def handle_error(self, request, client_address):
         # 浏览器关页面/关闭时断开是常态，不用打堆栈
@@ -1450,19 +1464,20 @@ def main() -> None:
     # 安卓上 WebView 用 http://localhost 访问，localhost 可能解析到 ::1。
     handler = make_handler(app, "ui")
     ui_servers = []
-    last_exc = None
+    bind_errors = []
     for host, cls in (("127.0.0.1", QuietServer), ("::1", QuietServer6)):
         try:
             ui_servers.append(cls((host, args.port), handler))
+            app.log(f"bind ok: {host}:{args.port}")
         except OSError as exc:
-            last_exc = exc
+            bind_errors.append(f"{host}: {exc!r}")
+            app.log(f"bind fail: {host}:{args.port} -> {exc!r}")
     if not ui_servers:
-        existing = f"http://localhost:{args.port}/"
-        print(f"端口 {args.port} 已被占用（可能上一个实例还开着）：{last_exc}")
-        print(f"直接打开已有实例：{existing}")
-        if not args.no_window:
-            open_window(existing)
-        return
+        # 不能静默 return：外层（安卓壳）只能看到“启动超时”，完全查不出原因
+        detail = "; ".join(bind_errors) or "unknown"
+        msg = f"无法监听端口 {args.port}（{detail}）"
+        app.log("[fatal] " + msg)
+        raise RuntimeError(msg)
     ui = ui_servers[0]
     for extra in ui_servers[1:]:
         threading.Thread(target=extra.serve_forever, daemon=True).start()

@@ -58,6 +58,8 @@ public class MainActivity extends Activity {
     private WebView webView;
     private TextView errorView;
     private final StringBuilder diag = new StringBuilder();
+    // Python 服务启动时的异常/日志，失败时展示到界面上
+    private volatile String pyError = null;
     // Python 解释器和 server 线程是进程级的；Activity 重建时不能重复启动
     private static volatile boolean sBooted = false;
 
@@ -184,11 +186,55 @@ public class MainActivity extends Activity {
     }
 
     private void showError(Throwable t) {
-        webView.setVisibility(View.GONE);
-        errorView.setVisibility(View.VISIBLE);
-        errorView.setText("启动失败：" + t + "\n\n"
-                + "地址：http://" + HOST + ":" + PORT + "/\n\n"
-                + "日志：adb logcat -s dsh-chat");
+        StringBuilder sb = new StringBuilder();
+        sb.append("启动失败：").append(t).append("\n\n");
+        sb.append("地址：http://").append(HOST).append(':').append(PORT).append("/\n");
+        sb.append("数据：").append(dataDir().getAbsolutePath()).append("\n");
+        sb.append("静态：").append(wwwDir().getAbsolutePath()).append("\n");
+        if (pyError != null) {
+            sb.append("\n--- Python 错误 ---\n").append(pyError);
+        }
+        String appLog = tailAppLog(40);
+        if (!appLog.isEmpty()) {
+            sb.append("\n--- app.log ---\n").append(appLog);
+        }
+        if (diag.length() > 0) {
+            sb.append("\n--- 页面日志 ---\n").append(diag);
+        }
+        String text = sb.toString();
+        Log.e(TAG, text);
+        runOnUiThread(() -> {
+            webView.setVisibility(View.GONE);
+            errorView.setVisibility(View.VISIBLE);
+            errorView.setText(text);
+        });
+    }
+
+    /** 读 data/app.log 的最后几行。Python 的 print 在安卓上只进 logcat，
+     *  但 App.log 会同时写这个文件，所以这是拿 Python 内部状态的唯一途径。 */
+    private String tailAppLog(int maxLines) {
+        File f = new File(dataDir(), "app.log");
+        if (!f.isFile()) {
+            return "";
+        }
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(new FileInputStream(f), StandardCharsets.UTF_8))) {
+            java.util.ArrayDeque<String> ring = new java.util.ArrayDeque<>();
+            String line;
+            while ((line = r.readLine()) != null) {
+                ring.addLast(line);
+                if (ring.size() > maxLines) {
+                    ring.removeFirst();
+                }
+            }
+            StringBuilder sb = new StringBuilder();
+            for (String l : ring) {
+                sb.append(l).append('\n');
+            }
+            return sb.toString();
+        } catch (IOException e) {
+            return "(读取失败: " + e + ")";
+        }
     }
 
     /** 显示完整诊断信息（含已收集的 console 日志）。必须在 UI 线程调用。 */
@@ -354,6 +400,7 @@ public class MainActivity extends Activity {
                 // serve_forever 会一直阻塞，所以必须在后台线程里跑
                 server.callAttr("main");
             } catch (Throwable e) {
+                pyError = Log.getStackTraceString(e);
                 Log.e(TAG, "server.main 退出", e);
             }
         }, "dsh-server");
@@ -364,21 +411,29 @@ public class MainActivity extends Activity {
     private void waitForServer(long timeoutMs) throws IOException {
         long deadline = System.currentTimeMillis() + timeoutMs;
         IOException last = null;
+        String[] probes = {"127.0.0.1", "localhost"};
         while (System.currentTimeMillis() < deadline) {
-            HttpURLConnection conn = null;
-            try {
-                conn = (HttpURLConnection) new URL(
-                        "http://" + HOST + ":" + PORT + "/local/status").openConnection();
-                conn.setConnectTimeout(1000);
-                conn.setReadTimeout(2000);
-                if (conn.getResponseCode() == 200) {
-                    return;
-                }
-            } catch (IOException e) {
-                last = e;
-            } finally {
-                if (conn != null) {
-                    conn.disconnect();
+            // Python 侧可能崩了，不用白等到超时
+            if (pyError != null) {
+                throw new IOException("Python 服务已退出");
+            }
+            for (String host : probes) {
+                HttpURLConnection conn = null;
+                try {
+                    conn = (HttpURLConnection) new URL(
+                            "http://" + host + ":" + PORT + "/local/status").openConnection();
+                    conn.setConnectTimeout(1000);
+                    conn.setReadTimeout(2000);
+                    if (conn.getResponseCode() == 200) {
+                        Log.i(TAG, "本地服务已就绪，探测通过: " + host);
+                        return;
+                    }
+                } catch (IOException e) {
+                    last = e;
+                } finally {
+                    if (conn != null) {
+                        conn.disconnect();
+                    }
                 }
             }
             try {
