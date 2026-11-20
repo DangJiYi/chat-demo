@@ -120,7 +120,17 @@
 .bottom {
   display: flex;
   flex-shrink: 0;
+  /* 底部有两个入口（本地与同步 / 设置），用 gap 分开 */
+  gap: 4px;
   height: 64px;
+
+  /* 两个按钮共用一行宽度。原来 .settings 是 width:100%，
+     两个并排会各自按 100% 参与计算、互相挤压，窄屏上第二个容易被挤没。 */
+  > .settings {
+    width: auto;
+    flex: 1 1 0;
+    min-width: 0;
+  }
 }
 
 .settings {
