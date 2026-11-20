@@ -70,6 +70,22 @@ cd android && gradle assembleDebug
    `--no-window --data <filesDir>/data --www <filesDir>/www --port 8790`。
 3. 轮询 `/local/status`，就绪后用 WebView 加载 `http://127.0.0.1:8790/`。
 
+### 目录约定（注意重复）
+
+`server.py` 在仓库里有两份：
+
+```text
+server/server.py                          Windows 打包用
+android/app/src/main/python/server.py     Chaquopy 用（默认源码目录）
+```
+
+Chaquopy 默认只认 `app/src/main/python/`，为了不引入额外配置（少一个出错点），
+这里直接放一份副本。**改 `server.py` 时必须同步两份**——CI 的 android job 里有一个
+`diff` 步骤会检查，不一致会直接失败。
+
+同样地 `android/app/build.gradle` 里没有 `python { }` 块：`server.py` 只用标准库，
+没有 pip 依赖，`buildPython` 用 Chaquopy 的默认值即可。
+
 ### 几个已知点
 
 - APK 用的是 **debug 签名**（Android SDK 的公共调试密钥）。自己用没问题；要和 release 包共存得先卸载。

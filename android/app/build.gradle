@@ -1,5 +1,7 @@
-apply plugin: 'com.android.application'
-apply plugin: 'com.chaquo.python'
+plugins {
+    id 'com.android.application'
+    id 'com.chaquo.python'
+}
 
 android {
     namespace 'com.dangjiyi.dshchat'
@@ -21,9 +23,8 @@ android {
 
     sourceSets {
         main {
-            // Python 源码：仓库根的 server/（server.py）
-            python.srcDir '../../server'
-            // 前端静态站：内容平铺进 assets 根，运行时由 MainActivity 复制到私有目录
+            // 前端静态站平铺进 assets 根；MainActivity 启动时复制到私有目录
+            // Python 源码用 Chaquopy 的默认位置 src/main/python（server.py 已放在那里）
             assets.srcDir '../../www'
         }
     }
@@ -44,17 +45,8 @@ android {
     }
 }
 
-// server.py 只用标准库，没有 pip 依赖，所以不需要 buildPython 去编译 wheel。
-// 但 Chaquopy 在配置阶段仍会检查这个字段，这里按平台挑一个存在的解释器。
-def buildPy = System.getenv('CHAQUOPY_BUILD_PYTHON')
-if (!buildPy) {
-    def candidates = ['/usr/bin/python3', '/usr/local/bin/python3']
-    def found = candidates.find { new File(it).exists() }
-    buildPy = found ?: 'python'
-}
-python {
-    buildPython buildPy
-}
+// 不写 python { } 块：server.py 只用标准库，没有 pip 依赖，
+// buildPython 用 Chaquopy 的默认值（Linux 上是 python3，runner 自带）。
 
 dependencies {
 }
