@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -919,8 +920,10 @@ class UIServer(Base):
                 body = json.dumps({"ip": mine, "port": app.sync_port,
                                    "name": app.config.get("deviceName", "")}).encode()
                 try:
-                    import urllib.request
                     # 注意：请求对端的**同步端口**（对端不知道我们的 UI 端口）
+                    # urllib.request 在模块顶部导入：若在这里 import，
+                    # urllib 会成为 local_api 的局部名，使前面所有 urllib.parse.unquote
+                    # 抛 UnboundLocalError（"cannot access local variable 'urllib'"）。
                     req = urllib.request.Request(
                         f"http://{ip}:{port}/peer",
                         data=body, method="POST",
