@@ -4,15 +4,22 @@ import android.app.Activity;
 import android.content.pm.PackageInfo;
 import android.content.res.AssetManager;
 import android.graphics.Color;
+import android.net.http.SslError;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.webkit.ConsoleMessage;
+import android.webkit.SslErrorHandler;
+import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import com.chaquo.python.PyObject;
@@ -46,6 +53,7 @@ public class MainActivity extends Activity {
 
     private WebView webView;
     private TextView errorView;
+    private final StringBuilder diag = new StringBuilder();
     // Python 解释器和 server 线程是进程级的；Activity 重建时不能重复启动
     private static volatile boolean sBooted = false;
 
@@ -58,12 +66,16 @@ public class MainActivity extends Activity {
         errorView = new TextView(this);
         root.addView(webView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        root.addView(errorView, new FrameLayout.LayoutParams(
+        // 诊断面板可滚动，白屏时能看清到底哪里出错
+        ScrollView scroller = new ScrollView(this);
+        scroller.addView(errorView);
+        root.addView(scroller, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         errorView.setVisibility(View.GONE);
-        errorView.setPadding(48, 96, 48, 48);
-        errorView.setTextColor(Color.parseColor("#444444"));
-        errorView.setTextSize(14f);
+        errorView.setPadding(40, 80, 40, 40);
+        errorView.setTextColor(Color.parseColor("#333333"));
+        errorView.setTextSize(13f);
+        errorView.setTextIsSelectable(true);
         setContentView(root);
 
         WebSettings settings = webView.getSettings();
@@ -75,6 +87,56 @@ public class MainActivity extends Activity {
         settings.setMediaPlaybackRequiresUserGesture(false);
         webView.setWebViewClient(new WebViewClient());
         webView.setBackgroundColor(Color.WHITE);
+
+        // 关键：没有这些回调，加载失败就只是一片白，什么都看不到
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest request,
+                                        WebResourceError error) {
+                if (request != null && request.isForMainFrame()) {
+                    showDiag("页面加载失败\n\n"
+                            + "URL: " + request.getUrl() + "\n"
+                            + "错误: " + error.getErrorCode() + " " + error.getDescription());
+                } else if (request != null) {
+                    diag.append("资源失败: ").append(request.getUrl()).append(" — ")
+                        .append(error.getDescription()).append('\n');
+                }
+            }
+
+            @Override
+            public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
+                handler.cancel();
+                showDiag("SSL 错误: " + error);
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                // 页面跑完了但 #root 里没东西，就是 JS 没渲染出来
+                view.evaluateJavascript(
+                        "(function(){var r=document.getElementById('root');"
+                      + "return JSON.stringify({root:r?r.childElementCount:-1,"
+                      + "body:document.body?document.body.innerText.length:0});})()",
+                        value -> {
+                            if (value != null && value.contains("\"root\":0")) {
+                                showDiag("页面已加载，但界面没有渲染出来。\n\n"
+                                        + "这通常意味着 JS 执行出错。\n"
+                                        + "请查看下方日志，或运行：\n"
+                                        + "adb logcat -s dsh-chat\n\n" + diag);
+                            }
+                        });
+            }
+        });
+
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onConsoleMessage(ConsoleMessage m) {
+                String line = "[" + m.messageLevel() + "] " + m.message()
+                        + " @" + m.sourceId() + ":" + m.lineNumber();
+                Log.w(TAG, line);
+                diag.append(line).append('\n');
+                return true;
+            }
+        });
 
         new Thread(this::boot, "dsh-boot").start();
     }
@@ -103,6 +165,16 @@ public class MainActivity extends Activity {
         errorView.setText("启动失败：" + t + "\n\n日志：adb logcat -s dsh-chat");
     }
 
+    /** 显示完整诊断信息（含已收集的 console 日志）。必须在 UI 线程调用。 */
+    private void showDiag(String text) {
+        Log.e(TAG, text);
+        runOnUiThread(() -> {
+            webView.setVisibility(View.GONE);
+            errorView.setVisibility(View.VISIBLE);
+            errorView.setText(text);
+        });
+    }
+
     // ---------------------------------------------------------------- 静态资源
 
     private File wwwDir() {
@@ -119,8 +191,9 @@ public class MainActivity extends Activity {
     private void extractAssets() throws IOException {
         File target = wwwDir();
         File stamp = new File(getFilesDir(), "www.stamp");
-        String want = String.valueOf(appVersionCode());
+        String want = appStamp();
         String have = stamp.isFile() ? readText(stamp) : "";
+        // index.html 必须存在，否则即便标记对得上也重新解压（防止上次解压半途而废）
         if (want.equals(have) && new File(target, "index.html").isFile()) {
             return;
         }
@@ -137,12 +210,17 @@ public class MainActivity extends Activity {
         }
     }
 
-    private int appVersionCode() {
+    /**
+     * 解压标记：versionCode + lastUpdateTime。
+     * 只用 versionCode 的话，重装同一个 versionCode 的包不会重新解压，
+     * 修好的 assets 永远进不了设备——这是个很难查的坑。
+     */
+    private String appStamp() {
         try {
             PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
-            return info.versionCode;
+            return info.versionCode + "-" + info.lastUpdateTime;
         } catch (Exception e) {
-            return 1;
+            return "0";
         }
     }
 
