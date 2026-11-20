@@ -1,8 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Android 9+ 默认禁明文 HTTP；这里只对回环地址放行，其余域名仍然强制 HTTPS。 -->
+<!--
+  Android 9+ 默认禁止明文 HTTP，而本应用的界面就是 WebView 加载本地服务。
+
+  关键：<domain> 只接受主机名，**不接受 IP 字面量**。
+  之前写成 <domain>127.0.0.1</domain> 会被静默忽略 → 明文被拦 → WebView 白屏，
+  而且不给任何提示。这是"打开全空白"的根因。
+
+  所以这里只放 localhost，并且 MainActivity 的 HOST 也是 "localhost"。
+  localhost 可能解析到 ::1，因此 server.py 的 UI 服务同时监听 127.0.0.1 和 ::1。
+
+  其余域名仍强制 HTTPS（没有 base-config 放宽）。
+-->
 <network-security-config>
     <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">127.0.0.1</domain>
         <domain includeSubdomains="false">localhost</domain>
     </domain-config>
 </network-security-config>

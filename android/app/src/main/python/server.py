@@ -510,6 +510,16 @@ class QuietServer(ThreadingHTTPServer):
         traceback.print_exc()
 
 
+class QuietServer6(QuietServer):
+    """监听 IPv6 回环。
+
+    安卓上 WebView 用 http://localhost:PORT 访问时，localhost 可能解析到 ::1；
+    Android 的 network-security-config 只接受主机名、不接受 IP，
+    所以安卓端必须用 localhost 才能让明文策略生效，也就必须同时监听 ::1。
+    """
+    address_family = socket.AF_INET6
+
+
 class Base(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     app: App = None  # 由子类注入
@@ -1436,15 +1446,27 @@ def main() -> None:
     WWW = os.path.abspath(args.www)
     app = App(os.path.abspath(args.data), args.port, args.sync_port)
 
-    try:
-        ui = QuietServer(("127.0.0.1", args.port), make_handler(app, "ui"))
-    except OSError as exc:
-        existing = f"http://127.0.0.1:{args.port}/"
-        print(f"端口 {args.port} 已被占用（可能上一个实例还开着）：{exc}")
+    # UI 服务同时监听 IPv4 与 IPv6 回环：
+    # 安卓上 WebView 用 http://localhost 访问，localhost 可能解析到 ::1。
+    handler = make_handler(app, "ui")
+    ui_servers = []
+    last_exc = None
+    for host, cls in (("127.0.0.1", QuietServer), ("::1", QuietServer6)):
+        try:
+            ui_servers.append(cls((host, args.port), handler))
+        except OSError as exc:
+            last_exc = exc
+    if not ui_servers:
+        existing = f"http://localhost:{args.port}/"
+        print(f"端口 {args.port} 已被占用（可能上一个实例还开着）：{last_exc}")
         print(f"直接打开已有实例：{existing}")
         if not args.no_window:
             open_window(existing)
         return
+    ui = ui_servers[0]
+    for extra in ui_servers[1:]:
+        threading.Thread(target=extra.serve_forever, daemon=True).start()
+    app.log(f"UI 服务监听: {', '.join(s.server_address[0] for s in ui_servers)}:{args.port}")
     try:
         sync = QuietServer(("0.0.0.0", args.sync_port), make_handler(app, "sync"))
         threading.Thread(target=sync.serve_forever, daemon=True).start()

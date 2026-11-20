@@ -47,9 +47,13 @@ import java.nio.charset.StandardCharsets;
 public class MainActivity extends Activity {
 
     private static final String TAG = "dsh-chat";
-    private static final String HOST = "127.0.0.1";
+    // 必须用主机名 localhost，不能用 IP：
+    // Android 的 network-security-config 里 <domain> 只接受主机名，
+    // 写 127.0.0.1 会被静默忽略 → 明文被拦 → WebView 白屏。
+    // 代价是 localhost 可能解析到 ::1，所以 Python 侧同时监听 IPv4/IPv6。
+    private static final String HOST = "localhost";
     private static final int PORT = 8790;
-    private static final long BOOT_TIMEOUT_MS = 60_000L;
+    private static final long BOOT_TIMEOUT_MS = 30_000L;
 
     private WebView webView;
     private TextView errorView;
@@ -71,11 +75,12 @@ public class MainActivity extends Activity {
         scroller.addView(errorView);
         root.addView(scroller, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        errorView.setVisibility(View.GONE);
+        errorView.setVisibility(View.VISIBLE);
         errorView.setPadding(40, 80, 40, 40);
         errorView.setTextColor(Color.parseColor("#333333"));
         errorView.setTextSize(13f);
         errorView.setTextIsSelectable(true);
+        errorView.setText("正在启动本地服务…\n\n首次启动需要解压前端资源，可能要几秒。");
         setContentView(root);
 
         WebSettings settings = webView.getSettings();
@@ -122,6 +127,10 @@ public class MainActivity extends Activity {
                                         + "这通常意味着 JS 执行出错。\n"
                                         + "请查看下方日志，或运行：\n"
                                         + "adb logcat -s dsh-chat\n\n" + diag);
+                            } else {
+                                // 渲染成功，把启动提示遮罩拿掉
+                                errorView.setVisibility(View.GONE);
+                                webView.setVisibility(View.VISIBLE);
                             }
                         });
             }
@@ -143,15 +152,20 @@ public class MainActivity extends Activity {
 
     private void boot() {
         try {
+            setStatus("正在解压前端资源…");
             extractAssets();
             if (sBooted) {
                 // 服务已经在跑（Activity 重建），直接等它就绪即可
+                setStatus("正在等待本地服务…");
                 waitForServer(BOOT_TIMEOUT_MS);
             } else {
+                setStatus("正在启动 Python 服务…");
                 startPython();
+                setStatus("正在等待本地服务就绪…");
                 waitForServer(BOOT_TIMEOUT_MS);
                 sBooted = true;
             }
+            setStatus("服务已就绪，正在加载界面…");
             runOnUiThread(() -> webView.loadUrl("http://" + HOST + ":" + PORT + "/"));
         } catch (Throwable t) {
             Log.e(TAG, "启动失败", t);
@@ -159,10 +173,22 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** 更新启动提示（遮罩上的文字）。已经在 UI 线程时要小心重复 post。 */
+    private void setStatus(String text) {
+        Log.i(TAG, text);
+        runOnUiThread(() -> {
+            if (errorView.getVisibility() == View.VISIBLE) {
+                errorView.setText(text);
+            }
+        });
+    }
+
     private void showError(Throwable t) {
         webView.setVisibility(View.GONE);
         errorView.setVisibility(View.VISIBLE);
-        errorView.setText("启动失败：" + t + "\n\n日志：adb logcat -s dsh-chat");
+        errorView.setText("启动失败：" + t + "\n\n"
+                + "地址：http://" + HOST + ":" + PORT + "/\n\n"
+                + "日志：adb logcat -s dsh-chat");
     }
 
     /** 显示完整诊断信息（含已收集的 console 日志）。必须在 UI 线程调用。 */
