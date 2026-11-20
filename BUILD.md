@@ -9,6 +9,23 @@ server/         Python 本地服务（server.py + PyInstaller 配置）
 android/        Chaquopy 安卓壳（把 server.py + www 打进 APK）
 ```
 
+## 改前端之后要重建 www
+
+`www/` 是构建产物（源码在 `src/`），两个打包产物都用它。改了 `src/` 必须重建，
+否则改了等于没改。
+
+双击工作区根目录的 `build-web.bat`（等价于下面这些）：
+
+```bash
+cd chat
+pnpm install --frozen-lockfile        # 首次
+rm -rf dist && NODE_ENV=production ./node_modules/.bin/rspack build -c rspack.config.ts
+rm -rf www && cp -r dist www
+```
+
+**不要直接跑 `pnpm build`**：它的脚本里是 `rm -rf dist && NODE_ENV=production ...`，
+这是 POSIX 写法，在 cmd.exe 里两个都会失败。
+
 ## 出 Windows 包
 
 在本机装 Python 3.9+ 和 PyInstaller，然后在 `server/` 目录：

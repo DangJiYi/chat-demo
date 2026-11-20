@@ -64,6 +64,15 @@ MAX_SESSION = 32 << 20
 MAX_FILE = 128 << 20
 LOCK = threading.RLock()
 
+# 拉取时向前回看的窗口。
+#
+# 前端只在“发问”时推进 updatedAt，回答完成时不再更新这个字段
+# （chat-demo-main/src/services/chat/store.ts: streamReply 结束时只 persist，不碰 updatedAt）。
+# 于是对端可能先拉到“只有问题、回答 pending”的快照，之后回答完成、内容变了但时间戳没变，
+# 按时间戳过滤就永远不会再发送 —— 表现为“同步后只看到问题，拿不到回答”。
+# 用回看窗口 + 幂等合并解决，不依赖前端改时间戳。
+SYNC_LOOKBACK_MS = 15 * 60 * 1000
+
 
 # ---------------------------------------------------------------- 小工具
 
@@ -708,7 +717,9 @@ class UIServer(Base):
             self.send_json(200, {"version": VERSION, "dataDir": app.data_dir,
                                  "port": app.ui_port, "syncPort": app.sync_port,
                                  "uptimeSec": int(time.time() - app.started),
-                                 "platform": sys.platform})
+                                 "platform": sys.platform,
+                                 "localIps": local_ips(),
+                                 "deviceName": app.config.get("deviceName", "")})
             return True
         if path == "/shutdown" and method == "POST":
             self.send_json(200, {"ok": True})
@@ -995,33 +1006,104 @@ def peer_url(peer: str) -> str:
     return peer.rstrip("/")
 
 
+# 助手消息的终态；用户消息没有 status，也算定稿
+_FINAL_STATUS = (None, "done", "stopped", "error")
+
+
+def _is_final(msg: dict) -> bool:
+    return msg.get("status") in _FINAL_STATUS
+
+
+def _more_complete(cur: dict, new: dict) -> bool:
+    """new 是否比 cur 更完整。已定稿胜过未定稿，否则比内容块多少。"""
+    if not _is_final(cur) and _is_final(new):
+        return True
+    if _is_final(cur) and not _is_final(new):
+        return False
+    a = cur.get("blocks")
+    b = new.get("blocks")
+    return (len(b) if isinstance(b, list) else 0) > (len(a) if isinstance(a, list) else 0)
+
+
 def merge_remote(app: App, remote: dict) -> bool:
+    """把对端会话合入本地。返回是否真的改了本地。
+
+    不能简单地“时间戳旧就丢弃”：回答完成不会推进 updatedAt，
+    对端那份可能时间戳一样、内容却多了一条回复。
+    """
     rid = remote.get("id")
     if not rid:
         return False
     local_raw = app.store.load_session(rid)
     if local_raw is None:
         app.store.save_remote(rid, json.dumps(remote, ensure_ascii=False).encode(),
-                                 bool(remote.get("deleted")))
+                              bool(remote.get("deleted")))
         return True
     local = json.loads(local_raw.decode("utf-8"))
-    if int(remote.get("updatedAt") or 0) > int(local.get("updatedAt") or 0):
-        app.store.save_remote(rid, json.dumps(remote, ensure_ascii=False).encode(),
-                                 bool(remote.get("deleted")))
+
+    local_del = bool(local.get("deleted"))
+    remote_del = bool(remote.get("deleted"))
+    # 墓碑优先：删掉的会话不能被旧副本复活
+    if remote_del and not local_del:
+        app.store.save_remote(rid, json.dumps(remote, ensure_ascii=False).encode(), True)
         return True
-    if int(remote.get("updatedAt") or 0) < int(local.get("updatedAt") or 0):
+    if local_del and not remote_del:
         return False
-    # 时间一样：消息按 id 求并集
-    seen = {m.get("id") for m in local.get("messages") or [] if isinstance(m, dict)}
-    added = False
+
+    lt = int(local.get("updatedAt") or 0)
+    rt = int(remote.get("updatedAt") or 0)
+    if rt > lt:
+        # 对端确实更新，整份替换
+        app.store.save_remote(rid, json.dumps(remote, ensure_ascii=False).encode(), False)
+        return True
+
+    # rt <= lt：逐条按完整度合并，不能整份丢弃
+    remote_by_id = {}
+    appended = []
     for msg in remote.get("messages") or []:
-        if isinstance(msg, dict) and msg.get("id") not in seen:
-            local.setdefault("messages", []).append(msg)
-            added = True
-    if not added:
+        if not isinstance(msg, dict):
+            continue
+        mid = msg.get("id")
+        if not mid:
+            continue
+        remote_by_id[mid] = msg
+
+    changed = False
+    out = []
+    seen = set()
+    for msg in local.get("messages") or []:
+        mid = msg.get("id") if isinstance(msg, dict) else None
+        if mid and mid in remote_by_id:
+            seen.add(mid)
+            if _more_complete(msg, remote_by_id[mid]):
+                msg = remote_by_id[mid]
+                changed = True
+        out.append(msg)
+    for msg in remote.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        mid = msg.get("id")
+        if mid and mid not in seen:
+            out.append(remote_by_id[mid])
+            appended.append(mid)
+            seen.add(mid)
+            changed = True
+
+    merged = dict(local)
+    merged["messages"] = out
+    # 树结构字段本地缺就从对端补，否则新追加的消息可能接不上
+    for key in ("rootMessageId", "selectedChildId"):
+        if merged.get(key) in (None, "") and remote.get(key) not in (None, ""):
+            merged[key] = remote[key]
+            changed = True
+    if not merged.get("title") and remote.get("title"):
+        merged["title"] = remote["title"]
+        changed = True
+
+    if not changed:
         return False
-    local["updatedAt"] = now_ms()
-    app.store.save_remote(rid, json.dumps(local, ensure_ascii=False).encode(), False)
+    # 刻意不推进 updatedAt：靠回看窗口重新拉取，合并幂等，不会来回覆盖
+    app.store.save_remote(rid, json.dumps(merged, ensure_ascii=False).encode(), False)
     return True
 
 
@@ -1035,7 +1117,11 @@ def pull_once(app: App) -> None:
     if not base:
         return
     try:
-        data = http_get_json(f"{base}/sync/since?since={state['cursor']}")
+        # 回看一段窗口：回答完成不会推进 updatedAt，只靠时间戳过滤会漏掉
+        # “问题已同步、回答后才落盘”的会话（详见 SYNC_LOOKBACK_MS 注释）。
+        # 合并是幂等的，重复拉到相同内容不会产生写入。
+        since = max(0, int(state["cursor"]) - SYNC_LOOKBACK_MS)
+        data = http_get_json(f"{base}/sync/since?since={since}")
         pulled = 0
         with LOCK:
             for doc in data.get("sessions") or []:
@@ -1388,6 +1474,38 @@ def open_window(url: str) -> None:
         webbrowser.open(url)
     except Exception as exc:  # noqa: BLE001
         print(f"打开浏览器失败({exc})，请手动访问 {url}")
+
+
+def local_ips() -> list:
+    """本机在局域网里的 IPv4 地址（不含回环）。
+
+    用 UDP connect 取出口地址：不会真的发包，只是让系统选出默认网卡。
+    安卓上需要 INTERNET 权限（已有），且不依赖 DNS。
+    """
+    ips = []
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.settimeout(0.3)
+        try:
+            # 任意公网地址均可；目的地址不合法也无妨，只为了拿到出口网卡
+            probe.connect(("223.5.5.5", 80))
+            ip = probe.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                ips.append(ip)
+        finally:
+            probe.close()
+    except OSError:
+        pass
+    if not ips:
+        # 没网时的退路：用主机名解析
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip = info[4][0]
+                if ip and not ip.startswith("127.") and ip not in ips:
+                    ips.append(ip)
+        except OSError:
+            pass
+    return ips
 
 
 def make_handler(app: App, kind: str):

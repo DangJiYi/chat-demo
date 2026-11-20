@@ -1,0 +1,118 @@
+/* 峰谷那一段照着 dsh-cost-meter 的 .cm-peak-progress 来：彩色圆点、6px 进度条、开始/切换时间 */
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 12px 6px;
+  padding: 10px 10px 8px;
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-2, rgba(127, 127, 127, 0.10));
+  font-size: 12px;
+  line-height: 16px;
+}
+
+/* 峰 = 橙（原插件 #ff9800），谷 = 品牌蓝 */
+.peak {
+  --peak-color: #4d6bfe;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.on {
+  --peak-color: #ff9800;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.phase {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--peak-color);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--peak-color);
+  flex: none;
+}
+
+.time {
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary, #8a8a8a);
+  white-space: nowrap;
+}
+
+.track {
+  height: 6px;
+  width: 100%;
+  border-radius: 99px;
+  overflow: hidden;
+  position: relative;
+  background: color-mix(in srgb, var(--peak-color) 12%, rgba(127, 127, 127, 0.18));
+}
+
+.fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  position: relative;
+  background: var(--peak-color);
+  transition: width 1s linear;
+}
+
+/* 进度条末端的小白点，和原插件一致 */
+.fill::after {
+  content: '';
+  position: absolute;
+  right: 2px;
+  top: 2px;
+  width: 2px;
+  height: 2px;
+  border-radius: 50%;
+  background: #fff;
+  opacity: 0.85;
+}
+
+.meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--dsw-alias-label-tertiary, #8a8a8a);
+}
+
+.meta span:last-child {
+  color: var(--dsw-alias-label-secondary, #999);
+  text-align: right;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.label {
+  color: var(--dsw-alias-label-tertiary, #8a8a8a);
+}
+
+.value {
+  font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-label-primary, #e8e8e8);
+}

@@ -1,0 +1,463 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Modal } from '../components/base/Modal.js'
+import { Button } from '../components/base/Button.js'
+import { showToast } from '../components/base/toastState.js'
+import { selectSession } from '../services/chat/store.js'
+import {
+  archiveNow,
+  bytes,
+  deleteSessions,
+  getConfig,
+  getDeviceStatus,
+  getStorage,
+  getSyncStatus,
+  imagesNow,
+  listArchived,
+  restoreSession,
+  saveConfig,
+  searchMessages,
+  syncNow,
+  type ArchivedItem,
+  type LocalConfig,
+  type SearchHit,
+  type StorageInfo,
+  type SyncStatus,
+} from './api.js'
+import styles from './LocalPanel.module.css'
+
+/** 把 "192.168.1.23:8791" 拆成 IP 与端口，界面上是两格 */
+const splitPeer = (peer: string): { host: string; port: string } => {
+  const value = peer.trim()
+  if (!value) return { host: '', port: '8791' }
+  const idx = value.lastIndexOf(':')
+  if (idx > 0 && /^\d+$/.test(value.slice(idx + 1))) {
+    return { host: value.slice(0, idx), port: value.slice(idx + 1) }
+  }
+  return { host: value, port: '8791' }
+}
+
+const joinPeer = (host: string, port: string): string => {
+  const h = host.trim()
+  if (!h) return ''
+  const p = port.trim() || '8791'
+  return `${h.includes(':') ? `[${h}]` : h}:${p}`
+}
+
+const dayLabel = (ms: number): string => {
+  const d = new Date(ms)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+/** 一条会话可能命中多条消息，按会话合并，只留第一条命中做片段 */
+type Group = { sessionId: string; title: string; archived: boolean; ts: number; hits: number; hit: SearchHit }
+
+const groupHits = (hits: SearchHit[]): Group[] => {
+  const map = new Map<string, Group>()
+  for (const hit of hits) {
+    const found = map.get(hit.sessionId)
+    if (found) {
+      found.hits += 1
+      continue
+    }
+    map.set(hit.sessionId, {
+      sessionId: hit.sessionId,
+      title: hit.title,
+      archived: hit.archived,
+      ts: hit.ts,
+      hits: 1,
+      hit,
+    })
+  }
+  return [...map.values()]
+}
+
+export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
+  const [cfg, setCfg] = useState<LocalConfig | null>(null)
+  const [storage, setStorage] = useState<StorageInfo | null>(null)
+  const [sync, setSync] = useState<SyncStatus | null>(null)
+  const [archived, setArchived] = useState<ArchivedItem[]>([])
+  const [busy, setBusy] = useState('')
+
+  const [host, setHost] = useState('')
+  const [port, setPort] = useState('8791')
+  /** 本机在局域网里的地址，填到对端那台机器的「对端 IP」里 */
+  const [localIp, setLocalIp] = useState('')
+  const [syncPort, setSyncPort] = useState(8791)
+
+  const [query, setQuery] = useState('')
+  const [hits, setHits] = useState<SearchHit[] | null>(null)
+  const [searchMs, setSearchMs] = useState(0)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const wrapRef = useRef<HTMLDivElement>(null)
+
+  const groups = useMemo(() => (hits ? groupHits(hits) : []), [hits])
+  const allSelected = groups.length > 0 && groups.every((g) => selected.has(g.sessionId))
+
+  /** 复制本端地址：对端那台机器要填的就是它 */
+  const copyLocal = async () => {
+    if (!localIp) {
+      return
+    }
+    const text = `${localIp}:${syncPort}`
+    try {
+      await navigator.clipboard.writeText(text)
+      showToast(`已复制本端地址 ${text}`)
+    } catch {
+      showToast(`本端地址：${text}`)
+    }
+  }
+
+  const refresh = async () => {
+    try {
+      const [c, s, sy, ar, dev] = await Promise.all([
+        getConfig(),
+        getStorage(),
+        getSyncStatus(),
+        listArchived(),
+        getDeviceStatus(),
+      ])
+      setCfg(c)
+      setStorage(s)
+      setSync(sy)
+      setArchived(ar)
+      setLocalIp(dev.localIps?.[0] ?? '')
+      setSyncPort(dev.syncPort ?? 8791)
+      const split = splitPeer(c.peer)
+      setHost(split.host)
+      setPort(split.port)
+    } catch {
+      // 服务没起来时保持空白
+    }
+  }
+
+  useEffect(() => {
+    wrapRef.current?.scrollTo(0, 0)
+    void refresh()
+  }, [])
+
+  const patch = async (next: Partial<LocalConfig>) => {
+    if (!cfg) return
+    setCfg({ ...cfg, ...next })
+    try {
+      setCfg(await saveConfig(next))
+    } catch {
+      showToast('保存失败')
+    }
+  }
+
+  const savePeer = () => void patch({ peer: joinPeer(host, port) })
+
+  const run = async (name: string, task: () => Promise<string>) => {
+    setBusy(name)
+    try {
+      showToast(await task())
+      await refresh()
+    } catch {
+      showToast('操作失败，看看服务是否还在')
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const search = async () => {
+    const q = query.trim()
+    if (!q) {
+      setHits(null)
+      setSelected(new Set())
+      return
+    }
+    try {
+      const res = await searchMessages(q)
+      setHits(res.hits)
+      setSearchMs(res.tookMs)
+      setSelected(new Set())
+    } catch {
+      showToast('搜索失败')
+    }
+  }
+
+  const toggle = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const toggleAll = () => {
+    setSelected(allSelected ? new Set() : new Set(groups.map((g) => g.sessionId)))
+  }
+
+  const open = async (group: Group) => {
+    if (group.archived) {
+      await restoreSession(group.sessionId)
+      showToast('已从归档恢复，正在打开')
+      setTimeout(() => location.reload(), 400)
+      return
+    }
+    selectSession(group.sessionId)
+    onClose()
+  }
+
+  const restoreSelected = () =>
+    void run('restore', async () => {
+      const ids = groups.filter((g) => g.archived && selected.has(g.sessionId)).map((g) => g.sessionId)
+      if (ids.length === 0) return '选中的都不在归档里'
+      for (const id of ids) await restoreSession(id)
+      setTimeout(() => location.reload(), 600)
+      return `已恢复 ${ids.length} 个会话`
+    })
+
+  const deleteSelected = () =>
+    void run('delete', async () => {
+      const ids = [...selected]
+      if (ids.length === 0) return '还没选'
+      const res = await deleteSessions(ids)
+      setHits((prev) => (prev ? prev.filter((h) => !selected.has(h.sessionId)) : prev))
+      setSelected(new Set())
+      return `已删除 ${res.deleted} 项`
+    })
+
+  return (
+    <Modal title="本地与同步" onClose={onClose}>
+      <div className={styles.wrap} ref={wrapRef}>
+        {/* ---------- 同步 ---------- */}
+        <section className={styles.section}>
+          <h3 className={styles.h}>同步</h3>
+          <div className={styles.fieldRow}>
+            <label className={styles.field}>
+              <span className={styles.label}>本端地址</span>
+              <input
+                className={styles.input}
+                readOnly
+                value={localIp ? `${localIp}:${syncPort}` : '未获取到（没连局域网？）'}
+              />
+            </label>
+            <Button variant="outlined" onClick={() => void copyLocal()} disabled={!localIp}>
+              复制
+            </Button>
+          </div>
+          <div className={styles.fieldRow}>
+            <label className={styles.field}>
+              <span className={styles.label}>对端 IP</span>
+              <input
+                className={styles.input}
+                placeholder="192.168.1.23"
+                value={host}
+                onChange={(e) => setHost(e.target.value)}
+                onBlur={savePeer}
+              />
+            </label>
+            <label className={`${styles.field} ${styles.narrow}`}>
+              <span className={styles.label}>端口</span>
+              <input
+                className={styles.input}
+                inputMode="numeric"
+                placeholder="8791"
+                value={port}
+                onChange={(e) => setPort(e.target.value)}
+                onBlur={savePeer}
+              />
+            </label>
+          </div>
+          <div className={styles.fieldRow}>
+            <label className={styles.field}>
+              <span className={styles.label}>间隔</span>
+              <select
+                className={styles.input}
+                value={cfg?.intervalSec ?? 3}
+                onChange={(e) => void patch({ intervalSec: Number(e.target.value) })}
+              >
+                <option value={3}>3 秒</option>
+                <option value={5}>5 秒</option>
+                <option value={10}>10 秒</option>
+              </select>
+            </label>
+            <Button variant="outlined" onClick={() => void run('sync', async () => '已同步')}>
+              {busy === 'sync' ? '同步中…' : '立即同步'}
+            </Button>
+          </div>
+          <p className={styles.hint}>
+            {sync?.peer
+              ? `对端 ${sync.peer} · ${sync.lastErr ? `上次出错：${sync.lastErr}` : `上次成功 ${new Date(sync.lastOk).toLocaleTimeString()}`} · 已拉取 ${sync.pulled} 条`
+              : '两台机器互相填对方的 IP 与端口（默认 8791）即可'}
+          </p>
+        </section>
+
+        {/* ---------- 归档 ---------- */}
+        <section className={styles.section}>
+          <h3 className={styles.h}>归档</h3>
+          <div className={styles.inlineRow}>
+            <span className={styles.label}>超过</span>
+            <input
+              className={`${styles.input} ${styles.number}`}
+              type="number"
+              min={7}
+              max={14}
+              value={cfg?.archiveDays ?? 7}
+              onChange={(e) => void patch({ archiveDays: Number(e.target.value) || 7 })}
+            />
+            <span className={styles.label}>天自动归档</span>
+          </div>
+          <div className={styles.inlineRow}>
+            <span className={styles.label}>超过</span>
+            <input
+              className={`${styles.input} ${styles.number}`}
+              type="number"
+              min={0}
+              max={60}
+              value={cfg?.imageDays ?? 14}
+              onChange={(e) => void patch({ imageDays: Number(e.target.value) || 0 })}
+            />
+            <span className={styles.label}>天压缩图片</span>
+          </div>
+          <div className={styles.fieldRow}>
+            <Button
+              variant="outlined"
+              onClick={() => void run('archive', async () => `归档了 ${(await archiveNow()).archived} 个会话`)}
+            >
+              {busy === 'archive' ? '整理中…' : '立即整理'}
+            </Button>
+            <Button
+              variant="outlined"
+              onClick={() =>
+                void run('images', async () => {
+                  const r = await imagesNow()
+                  return `压缩 ${r.shrunk} 张，省下 ${bytes(r.savedBytes)}`
+                })
+              }
+            >
+              {busy === 'images' ? '压缩中…' : '立即压缩图片'}
+            </Button>
+          </div>
+          <div className={styles.statsRow}>
+            <div className={styles.stat}>
+              <span className={styles.statValue}>{storage?.activeSessions ?? 0}</span>
+              <span className={styles.statLabel}>活跃会话 · {bytes(storage?.activeBytes ?? 0)}</span>
+            </div>
+            <div className={styles.stat}>
+              <span className={styles.statValue}>{storage?.archivedSessions ?? 0}</span>
+              <span className={styles.statLabel}>已归档 · {bytes(storage?.archiveBytes ?? 0)}</span>
+            </div>
+            <div className={styles.stat}>
+              <span className={styles.statValue}>{bytes(storage?.mediaBytes ?? 0)}</span>
+              <span className={styles.statLabel}>图片占用</span>
+            </div>
+          </div>
+        </section>
+
+        {/* ---------- 历史搜索 ---------- */}
+        <section className={styles.section}>
+          <h3 className={styles.h}>历史搜索</h3>
+          <div className={styles.searchBar}>
+            <svg className={styles.searchIcon} viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+              <circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" strokeWidth="2" />
+              <path d="M16.2 16.2L21 21" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            </svg>
+            <input
+              className={styles.searchInput}
+              placeholder="搜索聊天记录，中英文都行"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void search()
+              }}
+            />
+            <button type="button" className={styles.searchButton} onClick={() => void search()}>
+              搜索
+            </button>
+          </div>
+
+          {hits && (
+            <>
+              <div className={styles.toolbar}>
+                <label className={styles.checkAll}>
+                  <input type="checkbox" checked={allSelected} onChange={toggleAll} />
+                  全选
+                </label>
+                <span className={styles.toolbarInfo}>
+                  {groups.length} 会话 · {hits.length} 命中 · {searchMs}ms
+                  {selected.size > 0 ? ` · 已选 ${selected.size}` : ''}
+                </span>
+                <span className={styles.toolbarActions}>
+                  <button type="button" className={styles.textButton} disabled={!selected.size} onClick={restoreSelected}>
+                    恢复
+                  </button>
+                  <button
+                    type="button"
+                    className={`${styles.textButton} ${styles.danger}`}
+                    disabled={!selected.size}
+                    onClick={deleteSelected}
+                  >
+                    删除
+                  </button>
+                </span>
+              </div>
+
+              <ul className={styles.hits}>
+                {groups.map((group) => (
+                  <li key={group.sessionId} className={styles.hitRow}>
+                    <input
+                      type="checkbox"
+                      className={styles.check}
+                      checked={selected.has(group.sessionId)}
+                      onChange={() => toggle(group.sessionId)}
+                      aria-label={`选择 ${group.title}`}
+                    />
+                    <button type="button" className={styles.hit} onClick={() => void open(group)}>
+                      <span className={styles.hitTitle}>
+                        <span className={styles.hitName}>{group.title || '未命名会话'}</span>
+                        {group.archived && <em className={styles.badge}>已归档</em>}
+                        {group.hits > 1 && <em className={styles.badge}>{group.hits} 条命中</em>}
+                        <span className={styles.hitDate}>{dayLabel(group.ts)}</span>
+                      </span>
+                      <span className={styles.snippet}>
+                        {group.hit.snippet.slice(0, group.hit.offset)}
+                        <mark>{group.hit.snippet.slice(group.hit.offset, group.hit.offset + group.hit.length)}</mark>
+                        {group.hit.snippet.slice(group.hit.offset + group.hit.length)}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {groups.length === 0 && <p className={styles.hint}>没有命中，换个词试试</p>}
+            </>
+          )}
+        </section>
+
+        {/* ---------- 归档清单 ---------- */}
+        {archived.length > 0 && (
+          <section className={styles.section}>
+            <h3 className={styles.h}>归档会话（{archived.length}）</h3>
+            <ul className={styles.hits}>
+              {archived.slice(0, 30).map((item) => (
+                <li key={item.id}>
+                  <button
+                    type="button"
+                    className={styles.hit}
+                    onClick={() =>
+                      void run('restore', async () => {
+                        await restoreSession(item.id)
+                        setTimeout(() => location.reload(), 400)
+                        return '已恢复'
+                      })
+                    }
+                  >
+                    <span className={styles.hitTitle}>
+                      <span className={styles.hitName}>{item.title || '未命名会话'}</span>
+                      <span className={styles.hitDate}>
+                        {dayLabel(item.updatedAt)} · {item.msgCount} 条
+                      </span>
+                    </span>
+                    <span className={styles.hint}>点击恢复到活跃库</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+      </div>
+    </Modal>
+  )
+}
