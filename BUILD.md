@@ -118,12 +118,18 @@ DELETE /db/session/<id>     删会话（写墓碑，不删文件）
 cd rust && cargo run -- --port 8790
 ```
 
-**默认路径不依赖当前目录。** `www` 与 `data` 默认相对 **exe 所在目录**，
-并会向上逐级找（最多 5 层）。所以从 `rust/target/release/` 跑 exe 时，
-能在 `chat/www` 找到前端；双击 exe 也不会因为 CWD 是 System32 就 404。
+**默认路径不依赖当前目录。** 两者都以 **exe 所在目录**为基准：
 
-这一步是必需的，不是娇情：之前默认值用 CWD 相对路径，结果双击就报
-「index.html 缺失，界面会 404」。
+- **`www`：先找 exe 同级，再向上最多 5 层**。开发时 exe 在 `rust/target/release/`，
+  而 `www` 在 `chat/`，向上找免去每次手写 `--www ../www`。
+- **`data`：只用 exe 同级，绝不向上找**。向上扫会撞到无关目录。
+
+数据目录那条是踩出来的：exe 放在 `D:\Downloads\dsh-chat-rust-windows\`，
+往上扫到了 `D:\Downloads\data`，把数据目录指向了一个跟本应用无关的文件夹——
+用户看到空会话列表，以为聊天记录丢了。**数据目录宁可在 exe 旁新建，也不能猜。**
+
+CI 里有条回归断言专门盯这个：在上级放一个诱饵 `data/`，断言 `dataDir`
+仍是 exe 同级而不是诱饵。
 
 需要指定其他目录时：
 

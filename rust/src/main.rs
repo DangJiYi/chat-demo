@@ -24,20 +24,26 @@ struct Args {
     www: String,
 }
 
-/// 找一个默认目录：先看 exe 同级，再向上逐级找，都不存在就用 exe 同级。
+/// 找一个默认目录：exe 同级优先，其次向上逐级找（最多 5 层）。
 ///
-/// 为什么向上找：开发时 exe 在 `rust/target/release/`，而 `www` 与 `data`
-/// 在仓库根或 `chat/` 下。没有这一步，本地跑就得每次手写 `--www ../www`。
-fn resolve_default(exe_dir: &std::path::Path, name: &str) -> String {
-    // 向上最多找 5 级（target/release → target → rust → chat → 仓库根）
-    let mut probe = Some(exe_dir);
-    for _ in 0..5 {
-        let Some(dir) = probe else { break };
-        let candidate = dir.join(name);
-        if candidate.is_dir() {
-            return candidate.display().to_string();
+/// `allow_upward` 很关键：
+///   - www 允许向上找：开发时 exe 在 `rust/target/release/`，而 `www` 在 `chat/`，
+///     没有这一步本地跑就得每次手写 `--www ../www`。
+///   - data **禁止**向上找：向上扫会撞到无关目录。实测过一次：
+///     exe 在 `D:\Downloads\dsh-chat-rust-windows\`，往上找到 `D:\Downloads\data`，
+///     把数据目录指向了一个跟本应用无关的文件夹——用户看到空会话列表，
+///     以为数据丢了。数据目录只能由用户显式指定或建在 exe 旁。
+fn resolve_default(exe_dir: &std::path::Path, name: &str, allow_upward: bool) -> String {
+    if allow_upward {
+        let mut probe = Some(exe_dir);
+        for _ in 0..5 {
+            let Some(dir) = probe else { break };
+            let candidate = dir.join(name);
+            if candidate.is_dir() {
+                return candidate.display().to_string();
+            }
+            probe = dir.parent();
         }
-        probe = dir.parent();
     }
     exe_dir.join(name).display().to_string()
 }
@@ -56,8 +62,8 @@ fn parse_args() -> Args {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    let mut data = resolve_default(&exe_dir, "data");
-    let mut www = resolve_default(&exe_dir, "www");
+    let mut data = resolve_default(&exe_dir, "data", false);
+    let mut www = resolve_default(&exe_dir, "www", true);
 
     // 收成 Vec 再用下标遍历：避免 `while let Some(x) = it.next()` 在循环里
     // 又调用 it.next() 时被 clippy 判为 while_let_on_iterator。

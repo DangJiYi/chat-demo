@@ -153,28 +153,48 @@ jobs:
           }
 
           # 不传 --www 时应该相对 exe 所在目录向上找，而不能依赖 CWD。
+          # 同时放一个诱饵 data 目录在上级：它**不能**被采用。
+          # （实测过：exe 在 Downloads\xxx\，往上扫到 Downloads\data，
+          #   把数据目录指到了无关文件夹，用户看到空会话列表。）
           $layout = Join-Path $env:RUNNER_TEMP 'layout'
           $bin = Join-Path $layout 'rust\target\release'
-          New-Item -ItemType Directory -Force -Path $bin, (Join-Path $layout 'www') | Out-Null
+          New-Item -ItemType Directory -Force -Path $bin, (Join-Path $layout 'www'), (Join-Path $layout 'data') | Out-Null
           Set-Content -Encoding utf8 (Join-Path $layout 'www\index.html') '<div id=root>x</div>'
           Copy-Item $exe (Join-Path $bin 'dsh-chat.exe')
           Push-Location $env:RUNNER_TEMP
           $p2 = Start-Process -FilePath (Join-Path $bin 'dsh-chat.exe') -ArgumentList '--port','8798' -PassThru -NoNewWindow -RedirectStandardOutput 'out2.txt'
           try {
-            $ok2 = $false
+            $st2 = $null
             for ($i = 0; $i -lt 40; $i++) {
               Start-Sleep -Milliseconds 250
-              try { if ((Invoke-WebRequest 'http://127.0.0.1:8798/' -TimeoutSec 2).StatusCode -eq 200) { $ok2 = $true; break } } catch { }
+              try { $st2 = Invoke-RestMethod 'http://127.0.0.1:8798/local/status' -TimeoutSec 2; break } catch { }
             }
-            if (-not $ok2) { Get-Content 'out2.txt' -ErrorAction SilentlyContinue; throw '不传 --www 时未能从 exe 目录向上找到 www' }
-            Write-Host '默认路径解析 OK'
+            if ($null -eq $st2) { Get-Content 'out2.txt' -ErrorAction SilentlyContinue; throw '服务未就绪' }
+            if ((Invoke-WebRequest 'http://127.0.0.1:8798/' -TimeoutSec 2).StatusCode -ne 200) {
+              throw '不传 --www 时未能从 exe 目录向上找到 www'
+            }
+            Write-Host ("dataDir -> " + $st2.dataDir)
+            # 数据目录必须是 exe 同级，不能是上级那个诱饵
+            if ($st2.dataDir -notlike '*rust\target\release\data') {
+              throw "数据目录不应向上查找（诱饵被采用了）: $($st2.dataDir)"
+            }
+            Write-Host '默认路径解析 OK（www 向上找，data 只用 exe 同级）'
           } finally {
             Stop-Process -Id $p2.Id -Force -ErrorAction SilentlyContinue
             Pop-Location
           }
 
+      # 产物必须带上 www：只有 exe 的话，下载后必然“index.html 缺失、界面 404”。
+      - name: Package
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-pkg | Out-Null
+          Copy-Item rust/target/release/dsh-chat.exe dist-pkg/
+          Copy-Item -Recurse www dist-pkg/www
+          Compress-Archive -Path dist-pkg/* -DestinationPath dsh-chat-rust-win.zip -Force
+          Write-Host ("zip 大小: {0:N2} MB" -f ((Get-Item dsh-chat-rust-win.zip).Length / 1MB))
+
       - uses: actions/upload-artifact@v5
         with:
           name: dsh-chat-rust-windows
-          path: rust/target/release/dsh-chat.exe
+          path: dsh-chat-rust-win.zip
           if-no-files-found: error
