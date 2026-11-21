@@ -54,10 +54,13 @@ fn free_port() -> u16 {
 fn free_port_pair() -> u16 {
     for _ in 0..100 {
         let p = free_port();
-        if p >= 65535 {
+        // 同步端口是 p + 1，不能溢出（65535 是 u16 上限）。
+        // 用 checked_add 而不是 `p >= 65535`：后者会被 clippy 的
+        // absurd_extreme_comparisons 拦下，而且意图也不如这里直白。
+        let Some(next) = p.checked_add(1) else {
             continue;
-        }
-        if TcpListener::bind(("127.0.0.1", p + 1)).is_ok() {
+        };
+        if TcpListener::bind(("127.0.0.1", next)).is_ok() {
             return p;
         }
     }

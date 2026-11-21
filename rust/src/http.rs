@@ -192,9 +192,14 @@ pub fn handle(mut req: Request, st: &'static Store, www: &Path, version: &str) {
     // 不做这一步的后果不是 404 那么无害：db.ts 对 404 刻意不抛错（用来表达
     // “这条会话不存在”），于是 404 的错误体被当成数组去 .map()，界面报的是
     // “对话列表加载失败”——排查时完全看不出根因在路由前缀上。
-    let path = match raw_path.strip_prefix("/local/db") {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("/db{rest}"),
-        _ => raw_path,
+    //
+    // 用 starts_with + 切片而不是 strip_prefix：后者返回的 Option<&str> 会在整个
+    // match 期间持有 raw_path 的借用，导致另一分支无法 move raw_path（E0505）。
+    const DB_PREFIX: &str = "/local/db";
+    let path = if raw_path.starts_with(DB_PREFIX) {
+        format!("/db{}", &raw_path[DB_PREFIX.len()..])
+    } else {
+        raw_path.clone()
     };
 
     // ---------- /local/status ----------
