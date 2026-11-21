@@ -88,6 +88,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # 图标源图在 assets/icon.png；exe 图标由 build.rs 嵌入。
+      - name: Generate icons
+        run: python tools/make-icons.py
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -376,6 +380,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
+
+      # 安卓启动图标（mipmap-*）由这一步生成；gradle 打包时会用到。
+      - name: Generate icons
+        run: python3 tools/make-icons.py
 
       - uses: Swatinem/rust-cache@v2
         with:

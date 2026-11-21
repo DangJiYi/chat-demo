@@ -1,4 +1,7 @@
-//! 把前端产物 `chat/www/` 打进二进制，做成「一个 exe 就能跑」。
+//! 构建脚本，做两件事：
+//!
+//! 1. 把前端产物 `chat/www/` 打进二进制，做成「一个 exe 就能跑」
+//! 2. 把 `rust/assets/app.ico` 嵌进构建（托盘图标 + exe 本体图标）
 //!
 //! 为什么用 build.rs 而不是 `include_dir` 之类的 crate：
 //! 只需要列个文件名表 + `include_bytes!`，std 就够，不必为这点事
@@ -60,6 +63,58 @@ fn main() {
     // 但要让用户知道为什么界面 404。
     if files.is_empty() {
         println!("cargo:warning=没有找到前端产物 {}，exe 将不含界面", www.display());
+    }
+
+    embed_icon(&manifest, &out_dir);
+}
+
+/// 图标：把 `rust/assets/app.ico` 带进构建。
+///
+/// 两件事：
+///   1. 生成 `icon_embed.rs`，让 tray.rs 能拿到原始 .ico 字节去建托盘图标
+///   2. Windows 目标下编译一份资源脚本，把图标嵌进 exe 本体
+///      （否则资源管理器/任务栏显示的是通用 exe 图标）
+///
+/// .ico 由 `tools/make-icons.py` 从 `assets/icon.png` 生成，CI 会在 cargo 之前
+/// 跑它；本地想改图标也只需要跑那一次。
+/// **缺失时不阻断构建**：降级成默认图标 + 醒目警告，
+/// 总比因为少一张图就打不出包好。
+fn embed_icon(manifest: &Path, out_dir: &Path) {
+    let ico = manifest.join("assets").join("app.ico");
+    println!("cargo:rerun-if-changed={}", ico.display());
+
+    let mut src = String::from("// 由 build.rs 生成，请勿手改。\n");
+    if ico.is_file() {
+        let path: String = ico.to_string_lossy().into_owned();
+        src.push_str(&format!(
+            "pub static APP_ICO: Option<&[u8]> = Some(include_bytes!({path:?}));\n"
+        ));
+    } else {
+        src.push_str("pub static APP_ICO: Option<&[u8]> = None;\n");
+        println!(
+            "cargo:warning=缺少 {}，托盘与 exe 将用默认图标（运行 python tools/make-icons.py 生成）",
+            ico.display()
+        );
+    }
+    std::fs::write(out_dir.join("icon_embed.rs"), src).expect("写入 icon_embed.rs");
+
+    // 嵌进 exe 本体：只有 Windows 目标才做。
+    //
+    // 这一步需要 RC 编译器（rc.exe）。失败只告警、不阻断——
+    // 图标是装饰，不该成为“打不出包”的理由。
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") || !ico.is_file() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let mut res = winres::WindowsResource::new();
+        res.set_icon(&ico.to_string_lossy());
+        // 顺带写入文件描述：右键属性里能看到，排查“装的到底是哪个构建”很有用。
+        res.set("FileDescription", "dsh-chat");
+        res.set("ProductName", "dsh-chat");
+        if let Err(e) = res.compile() {
+            println!("cargo:warning=exe 图标/版本资源编译失败（不影响构建）: {e}");
+        }
     }
 }
 

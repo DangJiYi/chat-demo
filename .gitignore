@@ -18,3 +18,7 @@ __pycache__/
 
 # Rust 构建产物
 rust/target/
+
+# 图标生成过程中的临时中间件（tools/make-icons.py 正常不会留）
+assets/_px.bin
+rust/assets/_probe.txt

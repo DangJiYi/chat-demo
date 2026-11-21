@@ -72,6 +72,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# 把 .ico 嵌进 exe 本体（资源管理器/任务栏的图标就靠它）。
+# 只在 Windows 主机上需要：build.rs 为宿主编译，android 交叉编译时不会引入。
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
 # 体积优先：opt-level=z + LTO + strip，panic=abort 去掉展开表
 [profile.release]
 opt-level = "z"

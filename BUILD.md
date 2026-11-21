@@ -329,6 +329,38 @@ CI 里有条回归断言专门盯这个：在上级放一个诱饵 `data/`，断
 dsh-chat --port 8790 --data <数据目录> --www <前端目录>
 ```
 
+### 图标
+
+源图是 `assets/icon.png`（1024×1024 RGBA）。其它尺寸全部由它生成，不手工维护：
+
+```bash
+cd chat
+python tools/make-icons.py
+```
+
+产出：
+
+- `rust/assets/app.ico` —— 7 档（16…256），给 exe 本体和托盘图标用
+- `android/.../res/mipmap-*/ic_launcher.png` —— 安卓各密度启动图标
+
+工具只用标准库（`zlib` + `struct`），不依赖 Pillow；换图后跑一次就够。
+
+**生成物提交进仓库**：这样本地 `cargo build` 不需要装 Python 也能拿到图标，
+`build.rs` 也不用自己拉起子进程。CI 另外还会在编译前再跑一次脚本，
+保证“改了源图却忘了重新生成”时产物里也是新图标。
+
+图标在三个地方出现，各自的路子不同：
+
+- **exe 本体**（资源管理器/任务栏）：`build.rs` 通过 `winres` 编译一份资源脚本，
+  把 `.ico` 嵌进去。这一步失败只告警（图标是装饰，不该阻断打包）。
+- **托盘图标**：不能用 `LoadImageW`，它从磁盘读文件——我们是单 exe。
+  改成把 `.ico` 字节`include_bytes!` 进二进制，运行时解析 ICO 目录挑一张，
+  用 `CreateIconFromResourceEx` 生成 `HICON`。尺寸取 `GetSystemMetrics(SM_CXSMICON)`。
+- **安卓**：`AndroidManifest.xml` 的 `android:icon` 指向 `@mipmap/ic_launcher`。
+
+`.ico` 缺位时（比如没跑过脚本）全部降级：托盘与 exe 用系统默认图标，
+构建照常成功，`cargo` 会打一条 warning 说明原因。
+
 ### 单文件发布与自动开界面
 
 `build.rs` 把 `chat/www/` 下的每个文件变成 `include_bytes!`，直接编进 exe：
