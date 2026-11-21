@@ -162,6 +162,9 @@ pub struct Store {
     dir: PathBuf,
     port: u16,
     started: Instant,
+    /// 余额缓存：(取到的时间戳毫秒, 结果)。余额接口 60 秒内不重查，
+    /// 与 Python 版 balance_cache 的行为一致。
+    balance_cache: std::sync::Mutex<(i64, Option<serde_json::Value>)>,
 }
 impl Store {
     /// 建好目录结构。已存在则什么也不做（与 Python 版一致）。
@@ -181,6 +184,7 @@ impl Store {
             dir,
             port,
             started: Instant::now(),
+            balance_cache: std::sync::Mutex::new((0, None)),
         })
     }
 
@@ -313,6 +317,109 @@ impl Store {
     /// 各子目录占用，给 /local/storage 用。
     pub fn subdir_bytes(&self, name: &str) -> u64 {
         dir_size(&self.dir.join(name))
+    }
+
+    // ---------------------------------------------------------------- 配置 / Key
+
+    fn config_path(&self) -> PathBuf {
+        self.dir.join("meta").join("config.json")
+    }
+
+    fn key_path(&self) -> PathBuf {
+        self.dir.join("meta").join("secret.json")
+    }
+
+    /// 读配置，并补上默认值与校验——口径同 server.py 的 load_config。
+    ///
+    /// 用 serde_json::Map 而不是 struct：Python 版允许未知键存在（未来加字段不用两边同步），
+    /// 定成 struct 会把未知字段丢掉，反而制造不一致。
+    pub fn config(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut cfg: serde_json::Map<String, serde_json::Value> = match fs::read(self.config_path())
+        {
+            Ok(raw) => serde_json::from_slice(&raw).unwrap_or_default(),
+            Err(_) => serde_json::Map::new(),
+        };
+        cfg.entry("peer".into()).or_insert(serde_json::json!(""));
+        cfg.entry("intervalSec".into())
+            .or_insert(serde_json::json!(3));
+        cfg.entry("archiveDays".into())
+            .or_insert(serde_json::json!(7));
+        cfg.entry("imageDays".into())
+            .or_insert(serde_json::json!(14));
+        cfg.entry("deviceName".into())
+            .or_insert(serde_json::json!(hostname()));
+        cfg.entry("syncPort".into())
+            .or_insert(serde_json::json!(self.port as i64 + 1));
+
+        // 校验：非法值回落到默认，避免界面里存了脏数据后行为诡异
+        let interval = cfg.get("intervalSec").and_then(|v| v.as_i64()).unwrap_or(3);
+        if !matches!(interval, 3 | 5 | 10) {
+            cfg.insert("intervalSec".into(), serde_json::json!(3));
+        }
+        let days = cfg.get("archiveDays").and_then(|v| v.as_i64()).unwrap_or(7);
+        if !(7..=14).contains(&days) {
+            cfg.insert("archiveDays".into(), serde_json::json!(7));
+        }
+        let img_days = cfg.get("imageDays").and_then(|v| v.as_i64()).unwrap_or(14);
+        if img_days < 0 {
+            cfg.insert("imageDays".into(), serde_json::json!(14));
+        }
+        cfg
+    }
+
+    /// 保存配置：只更新已存在的键（与 Python 版一致——防止前端顺手塞进未知字段）。
+    pub fn save_config(
+        &self,
+        patch: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+        let mut cfg = self.config();
+        for (k, v) in patch {
+            if cfg.contains_key(k) {
+                cfg.insert(k.clone(), v.clone());
+            }
+        }
+        let out = serde_json::to_vec(&serde_json::Value::Object(cfg.clone()))
+            .map_err(|e| e.to_string())?;
+        atomic_write(&self.config_path(), &out).map_err(|e| format!("写入失败: {e}"))?;
+        Ok(cfg)
+    }
+
+    /// 读 API Key（存在 meta/secret.json，不进仓库）。
+    pub fn api_key(&self) -> String {
+        match fs::read(self.key_path()) {
+            Ok(raw) => serde_json::from_slice::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| {
+                    v.get("apiKey")
+                        .and_then(|k| k.as_str())
+                        .map(|s| s.trim().to_string())
+                })
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        }
+    }
+
+    pub fn save_api_key(&self, key: &str) -> Result<(), String> {
+        let doc = serde_json::json!({ "apiKey": key.trim() });
+        let out = serde_json::to_vec(&doc).map_err(|e| e.to_string())?;
+        atomic_write(&self.key_path(), &out).map_err(|e| format!("写入失败: {e}"))
+    }
+
+    /// 读余额缓存（60 秒内有效）。
+    pub fn cached_balance(&self) -> Option<serde_json::Value> {
+        let guard = self.balance_cache.lock().ok()?;
+        let (at, data) = &*guard;
+        if now_ms() - at < 60_000 {
+            data.clone()
+        } else {
+            None
+        }
+    }
+
+    pub fn cache_balance(&self, data: Option<serde_json::Value>) {
+        if let Ok(mut guard) = self.balance_cache.lock() {
+            *guard = (now_ms(), data);
+        }
     }
 
     // ---------------------------------------------------------------- 附件

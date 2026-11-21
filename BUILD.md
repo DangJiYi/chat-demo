@@ -82,6 +82,14 @@ GET    /                        静态文件（含 SPA fallback 与目录穿越�
 GET    /static/*                长缓存资源
 GET    /local/status            服务状态
 GET    /local/storage           存储占用
+GET    /local/config            读配置                PUT 改配置
+GET    /local/apikey            Key 状态            PUT 存 Key  DELETE 删除
+GET    /local/usage             用量与费用（会话/今日/本月）
+GET    /local/balance           余额（60 秒缓存）
+GET    /local/search            全文搜索（活跃 + 归档）
+GET    /local/archived          归档列表
+POST   /local/restore/<id>      从归档恢复
+POST   /local/delete            批量删除（区分归档与会话）
 GET    /health                  存活检查
 GET    /db/summaries            会话摘要（扫目录，按 updatedAt 倒序）
 GET    /db/session/<id>         读会话原文
@@ -97,9 +105,31 @@ POST   /db/staging/filetypes    回填附件 MIME
 POST   /db/staging/commit       暂存 → 正式
 ```
 
-**还差的**：`/local/*` 剩余 11 个端点（config / apikey / usage / balance /
-search / archived / delete / restore / sync 系列 / discover / pair）、
-同步端口 8791、UDP 发现 8792、安卓壳。
+**已能替代 Python 版跑 Windows**（聊天、计费、搜索、归档全通）。
+还差：同步端口 8791、UDP 发现 8792、`/local/discover` 与 `/local/pair*`、安卓壳。
+
+### 计费口径与测试
+
+`src/billing.rs` 里集中了时段、节假日、价目。日期换算用 Howard Hinnant 的
+`civil_from_days` 算法（约 20 行），不引 chrono——只为了算北京时间的年月日和星期，
+多一个依赖不划算。
+
+这四个单元测试是计费的「自证」：
+
+- `civil_dates_match_known_values`：1970-01-01 / 2000-03-01（闰年边界）/ 2026-11-21
+- `weekday_matches_python_convention`：周一=0，与 Python `weekday()` 一致
+- `peak_rules`：周五 10 点峰、13 点谷、周六全谷
+- `cost_is_halved_off_peak`：1M 未命中峰时 2 元、谷时 1 元
+
+期望值都是先用 Python 的 `datetime` 算出来再写进去的，不是拍脑袋。
+
+### 测试方式
+
+`tests/smoke.rs` 起真实二进制、发真实 HTTP 请求，覆盖静态文件、会话 CRUD、
+附件内容寻址、导入暂存、配置、Key、用量、搜索、归档恢复。
+
+断言放在 Rust 里而不是 CI 的 YAML 里：YAML 里的 PowerShell 断言很难写对类型
+（`byte[]` vs `string`、`@()` 包数组、`Uri` 预先规范化 `..`），而且只有推上去才知道错。
 
 `commit_staging` 与 Python 版有一处刻意的差别：Python 先删光 `sessions/` 再写，
 中途失败数据就没了；Rust 先把暂存会话全部写入，最后才删「不属于新集合」的旧文件。

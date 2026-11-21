@@ -15,6 +15,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 附件按内容寻址（media/<sha256>），与 Python 版的 hashlib.sha256 一致
 sha2 = "0.10"
+# 归档是 .jsonl.gz，搜索和归档去重都要解压
+flate2 = "1"
+# 只有 /local/balance 需要出站 HTTPS（查余额）。
+# default-features=false 是为了排除默认的 rustls（约 +1.5 MB）；
+# native-tls 在 Windows 上用 Schannel、Linux/macOS 用系统 OpenSSL，体积小得多。
+# json 特性提供 into_json()，测试和余额解析都要用。
+ureq = { version = "2", default-features = false, features = ["native-tls", "json"] }
 
 # 体积优先：opt-level=z + LTO + strip，panic=abort 去掉展开表
 [profile.release]

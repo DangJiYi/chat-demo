@@ -26,6 +26,12 @@ jobs:
         working-directory: rust
         run: cargo clippy --all-targets -- -D warnings
 
+      # 计费口径必须自证：峰谷判定、日期换算、费用系数。
+      # 用 dev profile 跑：release 设了 panic=abort，和测试运行器冲突。
+      - name: Unit tests
+        working-directory: rust
+        run: cargo test
+
       - name: Build
         working-directory: rust
         run: cargo build --release

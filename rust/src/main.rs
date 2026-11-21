@@ -6,6 +6,8 @@
 //! 已实现：静态文件、/local/status、/health、/db/summaries、
 //!         /db/session/<id> 的 GET/PUT/DELETE、/db/session/<id>/rename
 
+mod aggregate;
+mod billing;
 mod http;
 mod store;
 

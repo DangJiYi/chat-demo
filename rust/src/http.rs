@@ -8,6 +8,8 @@ use std::path::{Component, Path, PathBuf};
 use serde::Serialize;
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 
+use crate::aggregate;
+use crate::billing;
 use crate::store::Store;
 
 /// 请求体上限，与 Python 版 MAX_SESSION 一致。
@@ -507,6 +509,168 @@ pub fn handle(mut req: Request, st: &Store, www: &Path, version: &str) {
         return;
     }
 
+    // ---------- /local/config ----------
+    if path == "/local/config" {
+        match method {
+            Method::Get => send_json(req, 200, &store_cfg(st)),
+            Method::Put => {
+                let body = match read_body(&mut req) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        send_error(req, 400, &e);
+                        return;
+                    }
+                };
+                let patch: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_slice(&body).unwrap_or_default();
+                match st.save_config(&patch) {
+                    Ok(cfg) => send_json(req, 200, &cfg),
+                    Err(e) => send_error(req, 500, &e),
+                }
+            }
+            _ => send_error(req, 404, "not found"),
+        }
+        return;
+    }
+
+    // ---------- /local/apikey ----------
+    if path == "/local/apikey" {
+        match method {
+            Method::Get => {
+                let key = st.api_key();
+                send_json(
+                    req,
+                    200,
+                    &serde_json::json!({
+                        "configured": !key.is_empty(),
+                        "hint": key_hint(&key),
+                    }),
+                );
+            }
+            Method::Put => {
+                let body = match read_body(&mut req) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        send_error(req, 400, &e);
+                        return;
+                    }
+                };
+                #[derive(serde::Deserialize)]
+                struct KeyBody {
+                    #[serde(rename = "apiKey", default)]
+                    api_key: String,
+                }
+                let key = serde_json::from_slice::<KeyBody>(&body)
+                    .map(|b| b.api_key.trim().to_string())
+                    .unwrap_or_default();
+                if key.is_empty() {
+                    send_error(req, 400, "apiKey 不能为空");
+                    return;
+                }
+                match st.save_api_key(&key) {
+                    Ok(()) => send_json(
+                        req,
+                        200,
+                        &serde_json::json!({"configured": true, "hint": key_hint(&key)}),
+                    ),
+                    Err(e) => send_error(req, 500, &e),
+                }
+            }
+            Method::Delete => match st.save_api_key("") {
+                Ok(()) => send_no_content(req),
+                Err(e) => send_error(req, 500, &e),
+            },
+            _ => send_error(req, 404, "not found"),
+        }
+        return;
+    }
+
+    // ---------- /local/usage ----------
+    if path == "/local/usage" && method == Method::Get {
+        let sid = query_param(&url, "session").unwrap_or_default();
+        send_json(req, 200, &aggregate::usage(st, &sid));
+        return;
+    }
+
+    // ---------- /local/balance ----------
+    if path == "/local/balance" && method == Method::Get {
+        send_json(req, 200, &fetch_balance(st));
+        return;
+    }
+
+    // ---------- /local/search ----------
+    if path == "/local/search" && method == Method::Get {
+        let q = query_param(&url, "q").unwrap_or_default();
+        let limit = query_param(&url, "limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(50);
+        send_json(req, 200, &aggregate::search(st, &q, limit));
+        return;
+    }
+
+    // ---------- /local/archived ----------
+    if path == "/local/archived" && method == Method::Get {
+        send_json(req, 200, &aggregate::list_archived(st));
+        return;
+    }
+
+    // ---------- /local/restore/<id> ----------
+    if let Some(raw_id) = path.strip_prefix("/local/restore/") {
+        if method != Method::Post || raw_id.is_empty() {
+            send_error(req, 404, "not found");
+            return;
+        }
+        let id = urldecode(raw_id);
+        match aggregate::restore_archived(st, &id) {
+            Ok(()) => send_json(req, 200, &serde_json::json!({"restored": id})),
+            Err(e) => send_error(req, 404, &e),
+        }
+        return;
+    }
+
+    // ---------- /local/delete（批量删）----------
+    if path == "/local/delete" && method == Method::Post {
+        let body = match read_body(&mut req) {
+            Ok(b) => b,
+            Err(e) => {
+                send_error(req, 400, &e);
+                return;
+            }
+        };
+        #[derive(serde::Deserialize)]
+        struct DelBody {
+            #[serde(default)]
+            ids: Vec<String>,
+        }
+        let ids = serde_json::from_slice::<DelBody>(&body)
+            .map(|b| b.ids)
+            .unwrap_or_default();
+        let mut done = 0usize;
+        for id in ids {
+            if id.is_empty() {
+                continue;
+            }
+            // 归档项：从索引移除 + 写 archiveDeleted（不写会话墓碑）
+            match aggregate::delete_archived(st, &id) {
+                Ok(true) => {
+                    done += 1;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    // 索引写不了不阻断，但要让用户知道
+                    eprintln!("删除归档项 {id} 失败: {e}");
+                }
+            }
+            // 普通会话：写墓碑
+            if st.delete_session(&id).is_ok() {
+                done += 1;
+            }
+        }
+        send_json(req, 200, &serde_json::json!({ "deleted": done }));
+        return;
+    }
+
     // ---------- 其余交给静态文件 ----------
     if method == Method::Get {
         serve_static(req, www, path.trim_start_matches('/'));
@@ -533,4 +697,99 @@ fn urldecode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 从 query string 里取一个参数（已 urldecode）。
+fn query_param(url: &str, key: &str) -> Option<String> {
+    let q = url.split_once('?')?.1;
+    for pair in q.split('&') {
+        // 没有 '=' 的片段直接跳过，不能让一个脏片段毁掉整串查询
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        if k == key {
+            return Some(urldecode(v));
+        }
+    }
+    None
+}
+
+/// 配置响应：直接返回当前配置（含默认值）。
+fn store_cfg(st: &Store) -> serde_json::Value {
+    serde_json::Value::Object(st.config())
+}
+
+/// Key 提示：只露最后 4 位，形如 “…abcd”。
+fn key_hint(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() > 4 {
+        format!("…{}", chars[chars.len() - 4..].iter().collect::<String>())
+    } else {
+        String::new()
+    }
+}
+
+/// 把上游余额响应整理成前端要的形状。
+fn build_balance(raw: &serde_json::Value) -> serde_json::Value {
+    let infos = raw
+        .get("balance_infos")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    // 优先人民币，没有就取第一条（与 Python 版一致）
+    let pick = infos
+        .iter()
+        .find(|i| i.get("currency").and_then(|c| c.as_str()) == Some("CNY"))
+        .or_else(|| infos.first())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::json!({
+        "configured": true,
+        "available": raw.get("is_available"),
+        "currency": pick.get("currency"),
+        "total": pick.get("total_balance"),
+        "granted": pick.get("granted_balance"),
+        "toppedUp": pick.get("topped_up_balance"),
+        "at": crate::store::now_ms(),
+    })
+}
+
+/// 查余额。没有 Key 时返回 configured:false；出错把原因带回去，不报 500。
+///
+/// 错误也回 200 + error 字段：前端 UsageCard 就是按这个形状渲染
+/// （报 500 会让整张卡变成“查询失败”，看不出是没配 Key 还是 Key 失效）。
+fn fetch_balance(st: &Store) -> serde_json::Value {
+    let key = st.api_key();
+    if key.is_empty() {
+        return serde_json::json!({ "configured": false });
+    }
+    if let Some(cached) = st.cached_balance() {
+        return cached;
+    }
+
+    let result = match ureq::get("https://api.deepseek.com/user/balance")
+        .set("Authorization", &format!("Bearer {key}"))
+        .set("Accept", "application/json")
+        .timeout(std::time::Duration::from_secs(8))
+        .call()
+    {
+        Ok(resp) => match resp.into_json::<serde_json::Value>() {
+            Ok(raw) => build_balance(&raw),
+            Err(e) => {
+                serde_json::json!({ "configured": true, "error": format!("响应解析失败: {e}") })
+            }
+        },
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            // 按字符截断，避免切到多字节中间导致 panic
+            let brief: String = body.chars().take(300).collect();
+            serde_json::json!({
+                "configured": true,
+                "error": format!("HTTP {code}: {brief}")
+            })
+        }
+        Err(e) => serde_json::json!({ "configured": true, "error": format!("{e}") }),
+    };
+    st.cache_balance(Some(result.clone()));
+    result
 }
