@@ -148,28 +148,47 @@ cp server/server.py android/app/src/main/python/server.py
 
 ### APK 体积
 
-当前配置能减的都减了：
+实测数据（`apk-contents` artifact，arm64-only 构建）：
+
+```text
+解压总计      17.13 MB   148 个文件
+  lib/arm64-v8a      7.16 MB   libpython 3.10 + libcrypto 2.25 + libsqlite3 1.12
+  assets/chaquopy    6.47 MB   stdlib-common 2.82 + stdlib-arm64 1.38 + bootstrap 1.14
+  assets/static      3.44 MB   前端（已只留 woff2）
+  classes.dex 等     0.04 MB
+```
+
+所以 APK 本体约 17 MB（不压缩）/ 约 10 MB（下载）。
+**如果手机设置里显示 50 MB+，那是“APK + 解压出来的 .so + 数据”的合计，不是 APK 大小。**
+
+已经做过的：
 
 - **只出 `arm64-v8a`**（`android/app/build.gradle` 的 `abiFilters`）。
   Chaquopy 的 `libpython` 每个 ABI 一份，带 `armeabi-v7a` 等于 native 部分翻倍。
   2020 年后的安卓机都是 arm64；要兼容 32 位老机器就改回两个。
-- **字体只留 woff2**。KaTeX 每个字族都同时发 woff2/woff/ttf 三种，CSS 把 woff2 排第一，
-  另两种永远不会被加载（~900 KB 死重量）。构建脚本会自动删。
-- `assets/` 在 APK 里本身就会 deflate，所以 `www` 的 4.6 MB 原文件只占约 1.3 MB。
+- **字体只留 woff2**。KaTeX 每个字族都同时发 woff2/woff/ttf，CSS 把 woff2 排第一，
+  另两种永远不会被加载（~900 KB）。构建脚本会自动删。
+- **`useLegacyPackaging false`**：`.so` 不再解压到应用目录，直接从 APK 加载。
+  下载量 +4 MB，但手机占用 -7 MB（不保留副本）。
 
-**debug 与 release 的差异很大。** debug 构建不剥离 native 符号，`libpython` 的 `.so`
-会带着调试信息，体积可能翻倍。当前 CI 出的是 `assembleDebug`（免签名、直接能装），
-所以偏大是预期的。
+剩下的都是 Chaquopy 自带、改不动的东西：`libpython` 3.10 MB、stdlib 4.2 MB、
+`libsqlite3` 1.12 MB（`server.py` 不用 sqlite，但 Chaquopy 标准库是整包发的）、
+`libcrypto`+`libssl` 2.77 MB（HTTPS 代理必需）。
 
-要显著缩小，需要 **release 构建**（会 strip `.so`），而这需要一把自己的签名密钥：
+**还要更小只能换路子**：去掉 Python 运行时（换成 Kotlin/Go 原生实现），
+那不是一个配置能解决的。
+
+**debug 与 release 的差异。** debug 构建不剥离 native 符号。当前 CI 出的是
+`assembleDebug`（免签名、直接能装）。要 strip 需要 release 构建 + 自己的签名密钥：
 
 ```bash
 keytool -genkeypair -keystore release.keystore -alias dsh -keyalg RSA -keysize 2048 \
         -validity 10000 -storepass <你的密码> -keypass <你的密码>
 ```
 
-然后把 `release.keystore` 和两个密码存进仓库 Secrets，CI 里还原并加 `signingConfig`。
-这是一次性配置，做成后每次出包都是精简版。未配置前用 debug 也能用，只是大。
+把 keystore 和密码存进仓库 Secrets，CI 里还原并加 `signingConfig`。
+一次性配置，之后每次出包都是精简版。**注意：从 debug 签名换到自己的签名，
+手机上必须先卸载旧版再装**（签名不同不能覆盖安装）。
 
 ### 几个已知点
 
