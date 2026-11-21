@@ -100,7 +100,18 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------- Android
-  android:
+  # **已移到 rust-build（`.github/workflows/rust-build.yml`）。**
+  #
+  # 安卓现在和 Windows 用同一份 Rust 代码，两个平台要在一次触发里一起出包，
+  # 所以这个 job 整体搬到 rust-build 了（那里有 cargo-ndk + JNI 符号自检）。
+  #
+  # 这里保留 `if: false` 只是为了让这个历史 job 不再重复构建 30 分钟；
+  # 等新工作流跑绿后，整块可以删掉。
+  android-obsolete:
+    # 停用：整个 job 已移到 rust-build。
+    # 等那边跑绿后，这一段可以整块删掉。
+    # 等那边跑绿后，这一段可以整块删掉。
+    if: ${{ false }}
     needs: [web]
     runs-on: ubuntu-latest
     timeout-minutes: 30

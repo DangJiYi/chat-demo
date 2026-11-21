@@ -284,14 +284,25 @@ Windows 侧已与 Python 版对齐；安卓也换成同一份 Rust 代码（见�
    `cargo build` 会在链接阶段失败
 2. 执行 `cargo build` 会在工作区里跑构建脚本，权限策略会拦
 
-`.github/workflows/rust.yml` 做四件事：`clippy`（只把 correctness/suspicious
-两组当错误，其余风格问题不拦）→ `cargo test`（单测 + 两个端到端测试）
-→ `cargo build --release` → **真实启动服务并用 HTTP 请求断言** → 上传 exe artifact。
+`.github/workflows/rust-build.yml` 是 Rust 的统一构建入口，三个 job：
 
-自检不只验证“能编译”，而是真的造两个会话文件、起服务、请求两个端点，
-断言：返回 2 条、按 `updatedAt` 倒序（s2 在前）、中文标题正确、未知路径返回 404。
+- `web`：构建前端（两个平台都要用，产物 `www-dist`）
+- `windows`：`clippy`（只把 correctness/suspicious 两组当错误）→ `cargo test`
+  （单测 + 两个端到端测试）→ `cargo build --release` → **真实启动服务并用
+  HTTP 请求断言** → 上传单 exe
+- `android`：装 NDK + `cargo-ndk` → 交叉编译 `libdsh_chat_server.so` →
+  **JNI 符号自检**（用 `llvm-nm -D` 确认函数名对得上）→ gradle 出 APK
 
-跑法：Actions → `rust` → Run workflow。
+两个平台 job 都在 cargo 之前先把 `www/` 换成 `web` 的产物：
+`rust/build.rs` 在编译期把 `www/` 内嵌进二进制（exe 和 .so 都是），
+顺序错了打进去的就是仓库里那份旧前端。
+
+Windows 的自检不只验证“能编译”，而是真的造两个会话文件、起服务、
+断言：返回 2 条、按 `updatedAt` 倒序、中文标题正确、未知路径 404、
+附件按 sha256 落盘、导入暂存能提交。
+
+跑法：Actions → `rust-build` → Run workflow。
+一次触发就同时出两个包（`dsh-chat-rust-windows` / `dsh-chat-android`）。
 
 本地想自己跑的话，先装 VS Build Tools（勾 MSVC v143 + Windows SDK），再：
 

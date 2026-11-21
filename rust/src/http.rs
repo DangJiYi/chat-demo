@@ -162,8 +162,12 @@ fn serve_static(req: Request, www: &Path, rel: &str) {
     // 不加这个守卫的话，safe_join 会拼出一个相对路径去查当前工作目录，
     // 在安卓上属于无意义的文件系统访问。
     if !www.as_os_str().is_empty() {
-        if let Some(resp) = try_disk(req, www, rel) {
-            return resp;
+        // 先“查”再“回送”：查不需要请求对象，于是所有权一直留在本函数里。
+        // （之前让 try_disk 取走 req，返回时又用它回送内嵌资源，必然 E0382。）
+        match resolve_disk(www, rel) {
+            DiskHit::Found(path, name) => return serve_file(req, &path, &name),
+            DiskHit::Forbidden => return send_error(req, 403, "forbidden"),
+            DiskHit::Missing => {}
         }
     }
 
@@ -189,53 +193,50 @@ fn serve_static(req: Request, www: &Path, rel: &str) {
     );
 }
 
-/// 尝试从磁盘回送。返回 `Some(())` 表示已经回应过（含 403/500），
-/// `None` 表示磁盘上没有、应该继续找内嵌资源。
-fn try_disk(req: Request, www: &Path, rel: &str) -> Option<()> {
-    let mut full = match safe_join(www, rel) {
-        Some(p) => p,
-        None => {
-            send_error(req, 403, "forbidden");
-            return Some(());
-        }
+/// 磁盘查找的结果。
+///
+/// 刻意不持有 `Request`：让「查」和「回送」分开，请求对象就不会被白白移走。
+enum DiskHit {
+    /// 命中：文件路径 + 用于定 MIME 的名字
+    Found(PathBuf, String),
+    /// 路径非法（目录穿越），应当 403
+    Forbidden,
+    /// 磁盘上没有这个资源
+    Missing,
+}
+
+/// 在 `www` 下解析 `rel`：命中就返回文件路径，没命中就 Missing。
+fn resolve_disk(www: &Path, rel: &str) -> DiskHit {
+    let Some(mut full) = safe_join(www, rel) else {
+        return DiskHit::Forbidden;
     };
     if full.is_dir() {
         full = full.join("index.html");
     }
-    if !full.is_file() {
-        // 没扩展名的未知路径也回落到磁盘上的 index.html
-        if Path::new(rel).extension().is_none() {
-            let idx = www.join("index.html");
-            if idx.is_file() {
-                return match std::fs::read(&idx) {
-                    Ok(data) => {
-                        send_asset(req, data, "index.html");
-                        Some(())
-                    }
-                    Err(e) => {
-                        send_error(req, 500, &format!("读取失败: {e}"));
-                        Some(())
-                    }
-                };
-            }
-        }
-        return None;
+    if full.is_file() {
+        // 目录情形下真正回送的是 index.html，MIME 要按它算
+        let name = if full.ends_with("index.html") {
+            "index.html".to_string()
+        } else {
+            rel.to_string()
+        };
+        return DiskHit::Found(full, name);
     }
-    match std::fs::read(&full) {
-        // 目录情形下真正的文件名是 index.html，MIME 要按它算
-        Ok(data) => {
-            let name = if full.ends_with("index.html") {
-                "index.html"
-            } else {
-                rel
-            };
-            send_asset(req, data, name);
-            Some(())
+    // 没扩展名的未知路径也回落到磁盘上的 index.html
+    if Path::new(rel).extension().is_none() {
+        let idx = www.join("index.html");
+        if idx.is_file() {
+            return DiskHit::Found(idx, "index.html".to_string());
         }
-        Err(e) => {
-            send_error(req, 500, &format!("读取失败: {e}"));
-            Some(())
-        }
+    }
+    DiskHit::Missing
+}
+
+/// 读盘并回送。读失败是服务端/存储问题（500），不是 404。
+fn serve_file(req: Request, path: &Path, name: &str) {
+    match std::fs::read(path) {
+        Ok(data) => send_asset(req, data, name),
+        Err(e) => send_error(req, 500, &format!("读取失败: {e}")),
     }
 }
 

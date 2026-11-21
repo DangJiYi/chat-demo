@@ -1,4 +1,15 @@
-name: rust
+name: rust-build
+
+# Rust 后端的统一构建入口：**一次触发，同时出 Windows 和 Android**。
+#
+# 以前 Windows 和 Android 分属两个工作流（一个只管 Rust 的 Windows，另一个的
+# android job 挤在带旧 Python windows job 的 build 里），同一个 tag 要点两次，
+# artifact 名字相近却分属两代产品。现在合并到这一个文件：
+#   web     → 构建前端（两个平台都要用）
+#   windows → cargo 测试 + 单 exe（前端已内嵌）
+#   android → cargo ndk 出 .so + gradle 出 APK
+#
+# 仓库里那份 www/ 只当“参考产物”：两个 job 都会用 web 的产物覆盖它。
 
 on:
   push:
@@ -9,18 +20,80 @@ permissions:
   contents: read
 
 jobs:
-  # 编译 + 真实启动自检。这是唯一能验证 Rust 骨架的途径。
-  build:
-    runs-on: windows-latest
-    timeout-minutes: 20
+  # ---------------------------------------------------------------- Web
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '9'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # DSH_LOCAL=1 → apiOrigin 为空，请求走同源，由本地服务反向代理注入 Key。
+      # 漏了这个就变成直连上游 + 哨兵值当 Key，聊天恒 401。
+      - name: Build frontend
+        run: pnpm build
+        env:
+          DSH_LOCAL: '1'
+
+      - name: Trim font formats WebView never loads
+        run: |
+          find dist/static/media -name '*.ttf' -delete
+          find dist/static/media -name '*.woff' -delete
+
+      - name: Verify same-origin build
+        run: |
+          if grep -rq 'https://api.deepseek.com' dist/static/js/; then
+            echo "::error::dist 里出现了绝对地址，DSH_LOCAL 没生效"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: www-dist
+          path: dist
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- Windows
+  windows:
+    needs: [web]
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      # **必须最先做。** `rust/build.rs` 在编译期把 www/ 内嵌进二进制，
+      # 所以 www 必须在 cargo 之前就位；否则打进去的是仓库里那份旧产物。
+      # clippy/test 也会编译二进制（集成测试用 CARGO_BIN_EXE），同样吃这个顺序。
+      - name: Replace www with CI build
+        shell: bash
+        run: |
+          rm -rf www
+          mkdir -p www
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: www-dist
+          path: www
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          # 两个 job 的 target 不同（msvc / aarch64-linux-android），
+          # 缓存 key 不分开会互相覆盖。
+          key: windows
 
       - name: Clippy
         working-directory: rust
@@ -269,4 +342,126 @@ jobs:
         with:
           name: dsh-chat-rust-windows
           path: dsh-chat-rust-win.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- Android
+  android:
+    needs: [web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      # 同 Windows：前端要先就位，因为 build.rs 会把它内嵌进 .so。
+      - name: Replace www with CI build
+        run: |
+          rm -rf www
+          mkdir -p www
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: www-dist
+          path: www
+
+      # ---- Rust 后端：交叉编译出 arm64-v8a 的 libdsh_chat_server.so ----
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: android
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: true
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # cargo-ndk 把 CC/AR/linker 指向 NDK 的 clang；
+      # aarch64-linux-android 的 std 是预编译的，直接能链。
+      # 产物落在 android/app/src/main/jniLibs/arm64-v8a/，AGP 自动打进 APK。
+      - name: Build Rust backend (.so)
+        working-directory: rust
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          # --lib：只要 cdylib（libdsh_chat_server.so）。不指定的话会连 [[bin]]
+          # 一起为 aarch64-linux-android 编一个用不上的可执行文件。
+          cargo ndk -t arm64-v8a -o ../android/app/src/main/jniLibs build --release --lib
+          ls -lh ../android/app/src/main/jniLibs/arm64-v8a/
+          # 符号自检：JNI 函数名必须和 Java 侧的包名/类名/方法名对上，
+          # 库名要是 libdsh_chat_server.so（对应 Cargo.toml 的 [lib] name）。
+          # 对不上只会在手机上炸 UnsatisfiedLinkError，所以在这里就拦下来。
+          SO=../android/app/src/main/jniLibs/arm64-v8a/libdsh_chat_server.so
+          test -f "$SO" || { echo "::error::没有生成 libdsh_chat_server.so"; exit 1; }
+          NM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          if [ -x "$NM" ]; then
+            "$NM" -D "$SO" | grep -q 'Java_com_dangjiyi_dshchat_MainActivity_nativeStart' \
+              || { echo "::error::so 里缺 nativeStart 的 JNI 符号"; exit 1; }
+            "$NM" -D "$SO" | grep -q 'Java_com_dangjiyi_dshchat_MainActivity_nativeLastError' \
+              || { echo "::error::so 里缺 nativeLastError 的 JNI 符号"; exit 1; }
+            echo "JNI 符号检查通过"
+          fi
+          # 前端是否真的被内嵌进 .so：找一段只在真实前端里出现的字符串。
+          # 没有的话说明 build.rs 没找到 www，打出来的 APK 会白屏。
+          if strings "$SO" | grep -q 'id="root"'; then
+            echo "内嵌前端检查通过"
+          else
+            echo "::error::so 里没找到前端内容，APK 会白屏"
+            exit 1
+          fi
+
+      - name: Resolve versionName
+        id: v
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "name=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=0.2.3-$(date -u +%Y%m%d%H%M)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build APK
+        working-directory: android
+        run: gradle assembleDebug -PversionName=${{ steps.v.outputs.name }} --no-daemon
+
+      # 体积构成分析：解包 APK 按大小排序，直接看钱花在哪。
+      - name: Analyze APK size
+        run: |
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          echo "=== total ==="
+          ls -lh "$APK" | awk '{print $5}'
+          echo "=== by top-level dir ==="
+          unzip -l "$APK" | awk 'NR>3 && $4!="" {split($4,p,"/"); s[p[1]]+=$1} END {for (k in s) printf "%10.1f KB  %s\n", s[k]/1024, k}' | sort -rn | head -12
+          echo "=== 30 largest entries ==="
+          unzip -l "$APK" | awk 'NR>3 && $1 ~ /^[0-9]+$/ {printf "%10.1f KB  %s\n", $1/1024, $4}' | sort -rn | head -30
+          unzip -l "$APK" > apk-contents.txt
+          # .so 必须在 APK 里，否则装上就崩
+          unzip -l "$APK" | grep -q 'lib/arm64-v8a/libdsh_chat_server.so' \
+            || { echo "::error::APK 里没有 libdsh_chat_server.so"; exit 1; }
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: apk-contents
+          path: apk-contents.txt
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: dsh-chat-android
+          path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

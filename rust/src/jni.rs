@@ -86,9 +86,7 @@ pub extern "system" fn Java_com_dangjiyi_dshchat_MainActivity_nativeStart(
 /// 不用白等到 30 秒超时——超时提示「服务未就绪」会把真正的原因埋掉。
 #[no_mangle]
 pub extern "system" fn Java_com_dangjiyi_dshchat_MainActivity_nativeLastError(
-    // 用 mut：jni 0.21 的 new_string 需要 &mut self；
-    // 若它取 &self，这里只是多一个 unused_mut 警告，不会报错。
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
 ) -> jstring {
     let msg = match LAST_ERROR.lock() {
