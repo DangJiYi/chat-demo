@@ -70,6 +70,52 @@ spec 里是 `console=False`，所以 exe 不再弹控制台，而是常驻**系�
 
 `--no-window` 仍然有效：加它就不起托盘、不开浏览器，适合当纯后台服务跑。
 
+## Rust 版（进行中，逐步替代 server.py）
+
+`rust/` 是后端重写工程，目标是用一份代码同时覆盖 Windows exe 和安卓 `.so`，
+摆脱 Python 运行时（约省 13.6 MB）。
+
+**目前只实现了骨架**，用于验证链路是否成立：
+
+```text
+GET /local/status     服务状态（版本、数据目录、平台）
+GET /db/summaries     会话摘要列表（扫 sessions/*.json，按 updatedAt 倒序）
+GET /health           存活检查
+```
+
+其余端点按 `server.py` 逐个移植。**协议必须一致**——前端的
+`src/local/api.ts` 与 `src/services/chat/db.ts` 不改一行。
+
+### 编译与验证：走 CI
+
+本地调试有两个阻碍，所以骨架阶段直接交给 CI：
+
+1. 本机缺 MSVC 链接器（rustup 装了 `x86_64-pc-windows-msvc`，但没用 VS Build Tools），
+   `cargo build` 会在链接阶段失败
+2. 执行 `cargo build` 会在工作区里跑构建脚本，权限策略会拦
+
+`.github/workflows/rust.yml` 做四件事：`clippy -D warnings` → `cargo build --release`
+→ **真实启动服务并用 HTTP 请求断言** → 上传 exe artifact。
+
+自检不只验证“能编译”，而是真的造两个会话文件、起服务、请求两个端点，
+断言：返回 2 条、按 `updatedAt` 倒序（s2 在前）、中文标题正确、未知路径返回 404。
+
+跑法：Actions → `rust` → Run workflow。
+
+本地想自己跑的话，先装 VS Build Tools（勾 MSVC v143 + Windows SDK），再：
+
+```bash
+cd rust && cargo run -- --port 8790 --data ../data
+```
+
+### 设计约束
+
+- **不引 tokio**。并发上限就是「一个 WebView + 一个同步端口」，同步 HTTP 够用。
+  `axum`/`hyper` 会多带 1.5 MB，不划算。
+- **不改代理层之前不碰 TLS**。原版前端本就直连 `api.deepseek.com`（CORS 是通的），
+  去掉代理后 Rust 侧不需要 `rustls`，可再省 1.5 MB。
+- **数据目录结构与 Python 版完全一致**，两边能读同一份 `data/`。
+
 ## 出安卓包
 
 不用装 Android Studio。推一个 `v*` tag，或手动跑 Actions 的 `build` 工作流：

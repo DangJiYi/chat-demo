@@ -1,0 +1,89 @@
+name: rust
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # 编译 + 真实启动自检。这是唯一能验证 Rust 骨架的途径。
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Clippy
+        working-directory: rust
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        working-directory: rust
+        run: cargo build --release
+
+      # 真实启动服务并用 HTTP 请求验证。
+      # 只有「能跑起来且返回正确 JSON」才算骨架成立。
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "rust/target/release/dsh-chat.exe").Path
+          Write-Host ("exe 大小: {0:N2} MB" -f ((Get-Item $exe).Length / 1MB))
+
+          # 在临时目录里跑，用相对路径传 --data，避开含空格的绝对路径
+          $work = Join-Path $env:RUNNER_TEMP "rustsmoke"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          Set-Location $work
+          New-Item -ItemType Directory -Force -Path "data\sessions" | Out-Null
+
+          # 造两个会话，验证解析、UTF-8 标题、updatedAt 倒序
+          '{"id":"s1","title":"会话一","createdAt":1000,"updatedAt":2000,"messages":[]}' |
+            Set-Content -Encoding utf8 "data\sessions\s1.json"
+          '{"id":"s2","title":"会话二","createdAt":1000,"updatedAt":3000,"messages":[]}' |
+            Set-Content -Encoding utf8 "data\sessions\s2.json"
+
+          $p = Start-Process -FilePath $exe -ArgumentList '--port','8799','--data','data' `
+               -PassThru -NoNewWindow -RedirectStandardOutput "out.txt"
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 40; $i++) {
+              Start-Sleep -Milliseconds 250
+              try {
+                $r = Invoke-RestMethod -Uri "http://127.0.0.1:8799/local/status" -TimeoutSec 2
+                if ($r.version) { $ok = $true; break }
+              } catch { }
+            }
+            if (-not $ok) {
+              Get-Content "out.txt" -ErrorAction SilentlyContinue
+              throw "服务在 10 秒内未就绪"
+            }
+            Write-Host ("/local/status -> " + ($r | ConvertTo-Json -Compress))
+
+            $s = @(Invoke-RestMethod -Uri "http://127.0.0.1:8799/db/summaries" -TimeoutSec 5)
+            Write-Host ("/db/summaries -> " + ($s | ConvertTo-Json -Compress))
+
+            if ($s.Count -ne 2) { throw "期望 2 条会话，实际 $($s.Count)" }
+            if ($s[0].id -ne 's2') { throw "应按 updatedAt 倒序，首条应是 s2，实际 $($s[0].id)" }
+            if ($s[0].title -ne '会话二') { throw "UTF-8 标题解析错误: $($s[0].title)" }
+
+            $code = (Invoke-WebRequest -Uri "http://127.0.0.1:8799/nope" -SkipHttpErrorCheck).StatusCode
+            if ($code -ne 404) { throw "未知路径应返回 404，实际 $code" }
+
+            Write-Host '自检通过'
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: dsh-chat-rust-windows
+          path: rust/target/release/dsh-chat.exe
+          if-no-files-found: error

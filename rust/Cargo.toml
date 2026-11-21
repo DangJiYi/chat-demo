@@ -1,0 +1,23 @@
+[package]
+name = "dsh-chat-server"
+version = "0.1.0"
+edition = "2021"
+description = "dsh-chat 本地服务（Rust 重写，逐步替代 server.py）"
+
+[[bin]]
+name = "dsh-chat"
+path = "src/main.rs"
+
+[dependencies]
+# 同步 HTTP，不引 tokio：并发上限就是「一个 WebView + 一个同步端口」
+tiny_http = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 体积优先：opt-level=z + LTO + strip，panic=abort 去掉展开表
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
