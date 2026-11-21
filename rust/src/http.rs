@@ -1020,6 +1020,9 @@ fn build_balance(raw: &serde_json::Value) -> serde_json::Value {
 ///
 /// 错误也回 200 + error 字段：前端 UsageCard 就是按这个形状渲染
 /// （报 500 会让整张卡变成“查询失败”，看不出是没配 Key 还是 Key 失效）。
+///
+/// **只缓存成功结果。** Python 版就是这么做的，这里一度把失败也缓存 60 秒，
+/// 后果是：用户换好 Key、修好网络后，界面仍然要等一分钟才恢复。
 fn fetch_balance(st: &Store) -> serde_json::Value {
     let key = st.api_key();
     if key.is_empty() {
@@ -1029,7 +1032,8 @@ fn fetch_balance(st: &Store) -> serde_json::Value {
         return cached;
     }
 
-    let result = match ureq::get("https://api.deepseek.com/user/balance")
+    const URL: &str = "https://api.deepseek.com/user/balance";
+    let result = match ureq::get(URL)
         .set("Authorization", &format!("Bearer {key}"))
         .set("Accept", "application/json")
         .timeout(std::time::Duration::from_secs(8))
@@ -1037,23 +1041,45 @@ fn fetch_balance(st: &Store) -> serde_json::Value {
     {
         Ok(resp) => match resp.into_json::<serde_json::Value>() {
             Ok(raw) => build_balance(&raw),
-            Err(e) => {
-                serde_json::json!({ "configured": true, "error": format!("响应解析失败: {e}") })
-            }
+            Err(e) => balance_error(format!("响应解析失败: {e}")),
         },
         Err(ureq::Error::Status(code, resp)) => {
             let body = resp.into_string().unwrap_or_default();
             // 按字符截断，避免切到多字节中间导致 panic
             let brief: String = body.chars().take(300).collect();
-            serde_json::json!({
-                "configured": true,
-                "error": format!("HTTP {code}: {brief}")
-            })
+            let hint = match code {
+                401 | 403 => "（Key 无效、已删或类型不对）",
+                // 余额接口没有区域/版本分支；404 基本只说明请求没到 DeepSeek 官方，
+                // 而是被中转/代理/本地 hosts 接走了。
+                404 => {
+                    "（上游不存在该接口：余额固定走 api.deepseek.com/user/balance，\
+                        中转或代理地址不支持查余额）"
+                }
+                _ => "",
+            };
+            balance_error(format!("HTTP {code}{hint}：{brief}"))
         }
-        Err(e) => serde_json::json!({ "configured": true, "error": format!("{e}") }),
+        Err(e) => balance_error(format!("连不上 {URL}：{e}")),
     };
-    st.cache_balance(Some(result.clone()));
+
+    // 失败只记日志、不入缓存：下一轮请求会重新尝试，
+    // 否则用户改完 Key 或网络还得等一分钟才看到正确结果。
+    if result.get("error").is_some() {
+        let msg = result
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        st.note_balance_err(&msg);
+    } else {
+        st.cache_balance(Some(result.clone()));
+        st.clear_balance_err();
+    }
     result
+}
+
+fn balance_error(detail: String) -> serde_json::Value {
+    serde_json::json!({ "configured": true, "error": detail })
 }
 
 // ------------------------------------------------------------------ 同步端口

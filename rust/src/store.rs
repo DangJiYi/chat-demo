@@ -185,6 +185,8 @@ pub struct Store {
     /// 余额缓存：(取到的时间戳毫秒, 结果)。余额接口 60 秒内不重查，
     /// 与 Python 版 balance_cache 的行为一致。
     balance_cache: Mutex<(i64, Option<serde_json::Value>)>,
+    /// 上次记过日志的余额错误（用来去重，见 note_balance_err）。
+    balance_err: Mutex<String>,
     /// 同步运行状态（供 /local/sync/status）。
     sync: Mutex<SyncState>,
     /// 待本机确认的配对请求。
@@ -225,6 +227,7 @@ impl Store {
             port,
             started: Instant::now(),
             balance_cache: Mutex::new((0, None)),
+            balance_err: Mutex::new(String::new()),
             sync: Mutex::new(SyncState::default()),
             pair_requests: Mutex::new(Vec::new()),
             sync_bound: std::sync::atomic::AtomicU16::new(0),
@@ -484,7 +487,12 @@ impl Store {
     pub fn save_api_key(&self, key: &str) -> Result<(), String> {
         let doc = serde_json::json!({ "apiKey": key.trim() });
         let out = serde_json::to_vec(&doc).map_err(|e| e.to_string())?;
-        atomic_write(&self.key_path(), &out).map_err(|e| format!("写入失败: {e}"))
+        atomic_write(&self.key_path(), &out).map_err(|e| format!("写入失败: {e}"))?;
+        // 换了 Key 就必须丢掉旧的余额结果。
+        // 不清的话，上一次用旧 Key 查出来的错误会继续显示 60 秒，
+        // 用户会误以为“新 Key 也不行”（与 Python 版 save_key 一致）。
+        self.cache_balance(None);
+        Ok(())
     }
 
     /// 读余额缓存（60 秒内有效）。
@@ -558,6 +566,29 @@ impl Store {
     pub fn set_sync_bind_err(&self, msg: &str) {
         if let Ok(mut g) = self.sync_bind_err.lock() {
             *g = msg.to_string();
+        }
+    }
+
+    /// 记下余额查询错误，**只在错误内容变化时**写日志。
+    ///
+    /// 余额卡片每 60 秒重查一次，失败时如果每次都写一行，
+    /// app.log 会被同一句话刷满（控制台藏了，日志是唯一线索，不能被噪声埋掉）。
+    pub fn note_balance_err(&self, msg: &str) {
+        let mut last = match self.balance_err.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if last.as_str() != msg {
+            *last = msg.to_string();
+            drop(last);
+            crate::applog::write(self, &format!("余额查询失败：{msg}"));
+        }
+    }
+
+    /// 查余额成功时把错误标记清掉，下次失败能重新记一行。
+    pub fn clear_balance_err(&self) {
+        if let Ok(mut g) = self.balance_err.lock() {
+            g.clear();
         }
     }
 

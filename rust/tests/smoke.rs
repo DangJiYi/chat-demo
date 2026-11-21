@@ -691,3 +691,28 @@ fn frontend_local_db_prefix_is_served() {
         .expect("GET /db/summaries");
     assert_eq!(legacy.status(), 200);
 }
+
+/// 余额接口的形状契约。
+///
+/// 不断言真实余额：那要联网打 api.deepseek.com，CI 里既慢又不稳。
+/// 这里只锁住“没配 Key 时必须是 configured:false 且没有 error”——
+/// 界面靠这两个字段区分「未配置 Key」和「查询失败」。
+/// 把没配 Key 报成 error，用户就会看到一个猜不透的“查询失败”。
+#[test]
+fn balance_without_key_is_not_configured() {
+    let s = start(true);
+    let body: serde_json::Value = ureq::get(&s.url("/local/balance"))
+        .call()
+        .expect("GET /local/balance")
+        .into_json()
+        .expect("json");
+    assert_eq!(
+        body["configured"].as_bool(),
+        Some(false),
+        "没配 Key 时 configured 必须是 false: {body}"
+    );
+    assert!(
+        body.get("error").is_none(),
+        "没配 Key 不是错误，不该带 error: {body}"
+    );
+}
