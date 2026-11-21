@@ -11,10 +11,11 @@ android/        Chaquopy 安卓壳（把 server.py + www 打进 APK）
 
 ## 改前端之后要重建 www
 
-`www/` 是构建产物（源码在 `src/`），两个打包产物都用它。改了 `src/` 必须重建，
-否则改了等于没改。
+**打包时不需要你重建。** CI 的 `web` job 会从 `src/` 构建前端，
+再把它覆盖到 `www/`，然后 windows / android 两个 job 才开打。
+所以仓库里的 `www/` 只是“参考产物”，忘了重建也不会打出错界面。
 
-双击工作区根目录的 `build-web.bat`（等价于下面这些）：
+本地想自己看效果的话，双击工作区根目录的 `build-web.bat`（等价于下面这些）：
 
 ```bash
 cd chat

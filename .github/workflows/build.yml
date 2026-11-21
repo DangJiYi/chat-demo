@@ -9,12 +9,72 @@ permissions:
   contents: read
 
 jobs:
+  # ---------------------------------------------------------------- Web
+  # 前端由 CI 构建，不再依赖有人在本地跑 rspack。
+  # windows / android 两个 job 都会用这份产物覆盖 www/，
+  # 所以仓库里的 www/ 只当“参考产物”——即使忘了重建，打出来的包也是对的。
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '9'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # DSH_LOCAL=1 → apiOrigin 为空，请求走同源，由 server.py 反向代理注入 Key。
+      # 漏了这个就变成直连上游 + 哨兵值当 Key，聊天恒 401。
+      - name: Build frontend
+        run: pnpm build
+        env:
+          DSH_LOCAL: '1'
+
+      - name: Trim font formats WebView never loads
+        run: |
+          find dist/static/media -name '*.ttf' -delete
+          find dist/static/media -name '*.woff' -delete
+
+      - name: Verify same-origin build
+        run: |
+          if grep -rq 'https://api.deepseek.com' dist/static/js/; then
+            echo "::error::dist 里出现了绝对地址，DSH_LOCAL 没生效"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: www-dist
+          path: dist
+          if-no-files-found: error
+
   # ---------------------------------------------------------------- Windows
   windows:
+    needs: [web]
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+
+      # 用 CI 构建的前端覆盖仓库里的 www，保证 exe 里的界面与 src 一致
+      - name: Replace www with CI build
+        shell: bash
+        run: |
+          rm -rf www
+          mkdir -p www
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: www-dist
+          path: www
 
       - uses: actions/setup-python@v6
         with:
@@ -41,6 +101,7 @@ jobs:
 
   # ---------------------------------------------------------------- Android
   android:
+    needs: [web]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -54,6 +115,17 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
+
+      # 用 CI 构建出来的前端覆盖仓库里的 www，避免“改了 src 忘了重建”。
+      - name: Replace www with CI build
+        run: |
+          rm -rf www
+          mkdir -p www
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: www-dist
+          path: www
 
       - name: Check server.py copies are in sync
         run: diff server/server.py android/app/src/main/python/server.py

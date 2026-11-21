@@ -1069,6 +1069,35 @@ def dir_size(path: str) -> int:
     return total
 
 
+def dir_files_count(path: str) -> int:
+    n = 0
+    for _root, _dirs, files in os.walk(path):
+        n += len(files)
+    return n
+
+
+def dir_breakdown(path: str, limit: int = 8) -> list:
+    """列出子目录的占用，用于核对“体积到底花在哪”。
+
+    只看一层：www 下应该是 static / （可能误拷的）chaquopy / index.html 等。
+    返回 ["static 3.4 MB", "chaquopy 6.5 MB", ...]，大的在前。
+    """
+    rows = []
+    try:
+        for name in os.listdir(path):
+            full = os.path.join(path, name)
+            size = dir_size(full) if os.path.isdir(full) else (
+                os.path.getsize(full) if os.path.isfile(full) else 0)
+            rows.append((size, name + ("" if os.path.isdir(full) else " (file)")))
+    except OSError:
+        return []
+    rows.sort(reverse=True)
+    out = []
+    for size, name in rows[:limit]:
+        out.append(f"{name} {size / 1048576:.2f} MB")
+    return out
+
+
 def storage_info(app: App) -> dict:
     return {
         "activeSessions": len(app.store.summaries()),
@@ -1079,6 +1108,12 @@ def storage_info(app: App) -> dict:
         # 前端静态资源在私有目录里有一份解压副本（安卓读不了 APK 内的 assets），
         # 这份不算“你的数据”，但在系统设置里会计入用户数据，所以单独报出来。
         "assetsBytes": dir_size(WWW),
+        # 诊断用：目录名（带 versionCode 戳）与文件数。
+        # 正常应该是 www-<versionCode>-<lastUpdateTime> 且约 111 个文件；
+        # 如果看到固定名 www 加几百个文件，就是旧版本副本没清掉。
+        "assetsDir": os.path.basename(WWW.rstrip("/\\")),
+        "assetsFiles": dir_files_count(WWW),
+        "assetsBreakdown": dir_breakdown(WWW),
         "logBytes": os.path.getsize(os.path.join(app.data_dir, "app.log")) \
                      if os.path.isfile(os.path.join(app.data_dir, "app.log")) else 0,
     }

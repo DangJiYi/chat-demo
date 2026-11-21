@@ -546,11 +546,23 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
           </div>
           {/* 系统设置里的“用户数据”还包含解压出来的前端资源和日志，这里一并报出来，免得对不上账 */}
           <p className={styles.hint}>
-            界面文件 {bytes(storage?.assetsBytes ?? 0)} · 日志 {bytes(storage?.logBytes ?? 0)}
+            界面文件 {bytes(storage?.assetsBytes ?? 0)}
+            {storage?.assetsFiles != null ? `（${storage.assetsFiles} 个文件）` : ''}
+            {' · 日志 '}
+            {bytes(storage?.logBytes ?? 0)}
             {orphans && orphans.count > 0
               ? ` · 未使用附件 ${orphans.count} 个 ${bytes(orphans.bytes)}`
               : ''}
           </p>
+          {/* 诊断：目录名带版本戳，正常约 111 个文件；偏大或名字异常就是旧副本残留 */}
+          {storage?.assetsDir ? (
+            <p className={styles.hint}>
+              资源目录 {storage.assetsDir}
+              {storage.assetsBreakdown?.length
+                ? ` · ${storage.assetsBreakdown.join(' · ')}`
+                : ''}
+            </p>
+          ) : null}
         </section>
 
         {/* ---------- 历史搜索 ---------- */}

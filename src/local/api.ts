@@ -135,6 +135,12 @@ export type StorageInfo = {
   mediaBytes: number
   /** 解压到私有目录的前端静态资源（不计入会话数据，但系统会算进用户数据） */
   assetsBytes?: number
+  /** 解压目录名（带版本戳），用于核对装的是哪个构建 */
+  assetsDir?: string
+  /** 解压目录里的文件数；正常约 111，异常会明显偏大 */
+  assetsFiles?: number
+  /** 子目录占用明细，如 ["static 3.40 MB", "chaquopy 6.47 MB"] */
+  assetsBreakdown?: string[]
   /** app.log 大小 */
   logBytes?: number
 }
