@@ -133,7 +133,17 @@ export type StorageInfo = {
   activeBytes: number
   archiveBytes: number
   mediaBytes: number
+  /** 解压到私有目录的前端静态资源（不计入会话数据，但系统会算进用户数据） */
+  assetsBytes?: number
+  /** app.log 大小 */
+  logBytes?: number
 }
+
+/** 没有任何会话引用的附件（只统计，不自动删） */
+export type OrphanMedia = { count: number; bytes: number }
+
+export const getOrphans = async (): Promise<OrphanMedia> =>
+  json<OrphanMedia>(await fetch('/local/orphans'))
 
 export type ArchivedItem = {
   id: string
@@ -200,7 +210,8 @@ export const rejectPair = (r: PairRequest): Promise<unknown> =>
 
 export const getStorage = async (): Promise<StorageInfo> => json<StorageInfo>(await fetch('/local/storage'))
 
-export const archiveNow = (): Promise<{ archived: number }> => send('/archive/now', 'POST', {})
+export const archiveNow = (): Promise<{ archived: number; dedupSavedBytes?: number }> =>
+  send('/archive/now', 'POST', {})
 
 export const imagesNow = (): Promise<{ scanned: number; shrunk: number; savedBytes: number; skipped: number }> =>
   send('/images/now', 'POST', {})

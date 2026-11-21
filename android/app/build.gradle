@@ -17,7 +17,7 @@ android {
         applicationId 'com.dangjiyi.dshchat'
         minSdk 24
         targetSdk 34
-        versionCode 19
+        versionCode 20
         // CI 里用 -PversionName=v0.2.0 注入；本地构建用默认值
         versionName (project.findProperty('versionName') ?: '0.2.0')
 

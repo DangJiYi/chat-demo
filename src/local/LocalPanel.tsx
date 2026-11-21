@@ -11,6 +11,7 @@ import {
   discoverPeers,
   getConfig,
   getDeviceStatus,
+  getOrphans,
   getStorage,
   getSyncStatus,
   imagesNow,
@@ -24,6 +25,7 @@ import {
   type ArchivedItem,
   type DiscoveredPeer,
   type LocalConfig,
+  type OrphanMedia,
   type PairRequest,
   type SearchHit,
   type StorageInfo,
@@ -97,6 +99,9 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
   const [portDraft, setPortDraft] = useState('8791')
   /** 待本机确认的配对请求 */
   const [requests, setRequests] = useState<PairRequest[]>([])
+
+  /** 未使用附件（只显示，不自动清） */
+  const [orphans, setOrphans] = useState<OrphanMedia | null>(null)
 
   const [query, setQuery] = useState('')
   const [hits, setHits] = useState<SearchHit[] | null>(null)
@@ -213,6 +218,8 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
         listArchived(),
         getDeviceStatus(),
       ])
+      // 孤儿附件统计要扫归档，单独跑，失败不影响主体
+      void getOrphans().then(setOrphans).catch(() => setOrphans(null))
       setCfg(c)
       setStorage(s)
       setSync(sy)
@@ -497,7 +504,17 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
           <div className={styles.fieldRow}>
             <Button
               variant="outlined"
-              onClick={() => void run('archive', async () => `归档了 ${(await archiveNow()).archived} 个会话`)}
+              onClick={() =>
+                void run('archive', async () => {
+                  const res = await archiveNow()
+                  void refresh()
+                  const freed = res.dedupSavedBytes ?? 0
+                  // 归档去重是“立即整理”顺带做的，有释放就报出来
+                  return freed > 0
+                    ? `归档了 ${res.archived} 个会话，去重释放 ${bytes(freed)}`
+                    : `归档了 ${res.archived} 个会话`
+                })
+              }
             >
               {busy === 'archive' ? '整理中…' : '立即整理'}
             </Button>
@@ -527,6 +544,13 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
               <span className={styles.statLabel}>图片占用</span>
             </div>
           </div>
+          {/* 系统设置里的“用户数据”还包含解压出来的前端资源和日志，这里一并报出来，免得对不上账 */}
+          <p className={styles.hint}>
+            界面文件 {bytes(storage?.assetsBytes ?? 0)} · 日志 {bytes(storage?.logBytes ?? 0)}
+            {orphans && orphans.count > 0
+              ? ` · 未使用附件 ${orphans.count} 个 ${bytes(orphans.bytes)}`
+              : ''}
+          </p>
         </section>
 
         {/* ---------- 历史搜索 ---------- */}

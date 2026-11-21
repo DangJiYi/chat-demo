@@ -74,6 +74,9 @@ LOCK = threading.RLock()
 # 用回看窗口 + 幂等合并解决，不依赖前端改时间戳。
 SYNC_LOOKBACK_MS = 15 * 60 * 1000
 
+# app.log 大小上限；超过就只保留后半部分，避免手机占用无限增长
+LOG_MAX_BYTES = 1 << 20
+
 # UDP 自动发现：不用手填对端 IP。
 # 一台广播，另一台应答，列表里点一下即完成配对（两边都配好）。
 # 只在局域网用，与同步端口 8791（本来就无鉴权）同属一个信任模型。
@@ -503,13 +506,32 @@ class App:
 
     def log(self, msg: str) -> None:
         line = time.strftime("%H:%M:%S ") + msg
+        path = os.path.join(self.data_dir, "app.log")
         with self.log_lock:
             print(line, flush=True)
             try:
-                with open(os.path.join(self.data_dir, "app.log"), "a", encoding="utf-8") as f:
+                with open(path, "a", encoding="utf-8") as f:
                     f.write(line + "\n")
+                # 日志只增不减会一直吃空间；超过 1 MB 就只留最近一半。
+                if os.path.getsize(path) > LOG_MAX_BYTES:
+                    self._rotate_log(path)
             except OSError:
                 pass
+
+    @staticmethod
+    def _rotate_log(path: str) -> None:
+        """保留文件后半部分。宁可丢老日志，也不要无限增长。"""
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            keep = data[len(data) // 2:]
+            # 从下一行开头起，避免保留半行
+            cut = keep.find(b"\n")
+            if cut >= 0:
+                keep = keep[cut + 1:]
+            atomic_write(path, keep)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------- HTTP 基础设施
@@ -984,8 +1006,19 @@ class UIServer(Base):
             return True
 
         if path == "/archive/now" and method == "POST":
+            # 用户点“立即整理”时才做去重：这是显式动作，不在后台自动删东西。
+            freed = 0
+            try:
+                freed = compact_archive(app).get("savedBytes", 0)
+            except Exception as exc:  # noqa: BLE001
+                app.log(f"归档去重失败: {exc!r}")
             n = archive_once(app)
-            self.send_json(200, {"archived": n})
+            self.send_json(200, {"archived": n, "dedupSavedBytes": freed})
+            return True
+
+        if path == "/orphans" and method == "GET":
+            # 只统计不删除，给界面显示“未使用附件占多少”
+            self.send_json(200, orphan_media(app))
             return True
 
         if path == "/delete" and method == "POST":
@@ -1043,6 +1076,11 @@ def storage_info(app: App) -> dict:
         "activeBytes": dir_size(os.path.join(app.data_dir, "sessions")) + dir_size(os.path.join(app.data_dir, "meta")),
         "archiveBytes": dir_size(os.path.join(app.data_dir, "archive")),
         "mediaBytes": dir_size(os.path.join(app.data_dir, "media")),
+        # 前端静态资源在私有目录里有一份解压副本（安卓读不了 APK 内的 assets），
+        # 这份不算“你的数据”，但在系统设置里会计入用户数据，所以单独报出来。
+        "assetsBytes": dir_size(WWW),
+        "logBytes": os.path.getsize(os.path.join(app.data_dir, "app.log")) \
+                     if os.path.isfile(os.path.join(app.data_dir, "app.log")) else 0,
     }
 
 
@@ -1294,6 +1332,128 @@ def sync_loop(app: App) -> None:
 
 
 # ---------------------------------------------------------------- 归档 / 图片 / 搜索 / 计费
+
+def compact_archive(app: App) -> dict:
+    """把归档里重复的会话条目合并掉（每个会话只保留最新的一份）。
+
+    归档是“追加一个 gzip member”写进去的，所以同一个会话被恢复后再次归档、
+    或者同步把对端旧副本又拉回来，就会在同一个文件里出现多份。
+    每份都是完整会话，重复就是白占空间。
+
+    只删“同一个会话的旧副本”，不会丢掉任何会话，也不会动附件原件。
+    """
+    archive_dir = os.path.join(app.data_dir, "archive")
+    if not os.path.isdir(archive_dir):
+        return {"files": 0, "dropped": 0, "savedBytes": 0}
+    total_files = dropped = saved = 0
+    for name in sorted(os.listdir(archive_dir)):
+        if not name.endswith(".jsonl.gz"):
+            continue
+        path = os.path.join(archive_dir, name)
+        latest = {}          # sid -> (archivedAt, doc)
+        original = 0
+        try:
+            before = os.path.getsize(path)
+            with gzip.open(path, "rt", encoding="utf-8") as f:
+                for line in f:
+                    original += 1
+                    try:
+                        env = json.loads(line)
+                    except ValueError:
+                        continue
+                    doc = env.get("session") or {}
+                    sid = doc.get("id")
+                    if not sid:
+                        continue
+                    at = int(env.get("archivedAt") or 0)
+                    if sid not in latest or at >= latest[sid][0]:
+                        latest[sid] = (at, doc)
+        except (OSError, EOFError):
+            continue
+        total_files += 1
+        if not latest or original <= len(latest):
+            continue                      # 没有重复，不动它
+
+        lines, md = [], []
+        for sid, (at, doc) in latest.items():
+            lines.append(json.dumps({"archivedAt": at, "session": doc},
+                                    ensure_ascii=False) + "\n")
+            msgs = doc.get("messages") or []
+            last_user = ""
+            for msg in reversed(msgs):
+                if isinstance(msg, dict) and msg.get("role") == "user" and msg.get("content"):
+                    last_user = str(msg["content"]).replace("\n", " ")[:160]
+                    break
+            md.append(f"## {doc.get('title', '')}\n\n- id: `{sid}`\n"
+                      f"- 最后活动: {bj(int(doc.get('updatedAt') or at)).strftime('%Y-%m-%d %H:%M')}\n"
+                      f"- 消息数: {len(msgs)}\n- 最后提问: {last_user}\n\n")
+        try:
+            atomic_write(path, gzip.compress("".join(lines).encode("utf-8")))
+            atomic_write(path[:-len(".jsonl.gz")] + ".md", "".join(md).encode("utf-8"))
+            saved += max(0, before - os.path.getsize(path))
+            dropped += max(0, original - len(latest))
+        except OSError:
+            continue
+    if dropped or saved:
+        app.log(f"归档去重：移除 {dropped} 条重复，释放 {saved // 1024} KB")
+    return {"files": total_files, "dropped": dropped, "savedBytes": saved}
+
+
+def orphan_media(app: App) -> dict:
+    """统计“没有任何会话引用”的附件原件，**只统计不删除**。
+
+    删除归档会话时旧逻辑只写了墓碑，没动 media，那些图片会永久留在磁盘上。
+    这里把活跃会话 + 归档内容过一遍算出孤儿，大小报给界面让用户自己决定。
+    """
+    referenced = set()
+
+    def collect_files(doc):
+        for msg in doc.get("messages") or []:
+            if not isinstance(msg, dict):
+                continue
+            for f in msg.get("files") or []:
+                if isinstance(f, dict) and f.get("id"):
+                    referenced.add(f["id"])
+
+    for meta in app.store.summaries():
+        raw = app.store.load_session(meta["id"])
+        if not raw:
+            continue
+        try:
+            collect_files(json.loads(raw.decode("utf-8")))
+        except ValueError:
+            continue
+
+    archive_dir = os.path.join(app.data_dir, "archive")
+    if os.path.isdir(archive_dir):
+        for name in sorted(os.listdir(archive_dir)):
+            if not name.endswith(".jsonl.gz"):
+                continue
+            try:
+                with gzip.open(os.path.join(archive_dir, name), "rt", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            env = json.loads(line)
+                        except ValueError:
+                            continue
+                        collect_files(env.get("session") or {})
+            except (OSError, EOFError):
+                continue
+
+    count = size = 0
+    for fid, fm in app.store.idx["files"].items():
+        if fid in referenced:
+            continue
+        sha = fm.get("sha")
+        if sha and any(o.get("sha") == sha for o in app.store.idx["files"].values()):
+            continue
+        try:
+            size += os.path.getsize(os.path.join(app.data_dir, "media", sha or ""))
+            count += 1
+        except OSError:
+            pass
+    return {"count": count, "bytes": size}
+
 
 def archive_once(app: App) -> int:
     days = max(1, int(app.config.get("archiveDays", 7)))
