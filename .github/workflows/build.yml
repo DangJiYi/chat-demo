@@ -130,6 +130,55 @@ jobs:
       - name: Check server.py copies are in sync
         run: diff server/server.py android/app/src/main/python/server.py
 
+      # ---- Rust 后端：交叉编译出 arm64-v8a 的 libdsh_chat.so ----
+      #
+      # 注意顺序：必须在“Replace www”之后。`rust/build.rs` 会把 chat/www 内嵌进
+      # .so（安卓端不再从 assets 解压前端），所以要先把 CI 构建出来的 www 放好。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          # 与 windows 侧分开缓存：target 不同（aarch64-linux-android）
+          key: android
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: true
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # cargo-ndk 负责把 CC/AR/linker 环境变量指向 NDK 的 clang，
+      # aarch64-linux-android 的 std 是预编译的，直接能链。
+      # 产物落在 android/app/src/main/jniLibs/arm64-v8a/libdsh_chat.so，
+      # AGP 会自动打进 APK。
+      - name: Build Rust backend (.so)
+        working-directory: rust
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a -o ../android/app/src/main/jniLibs build --release
+          ls -lh ../android/app/src/main/jniLibs/arm64-v8a/
+          # 符号自检：JNI 函数名必须和 Java 侧的包名/类名/方法名对上，
+          # 且库名要是 libdsh_chat_server.so（对应 Cargo.toml 的 [lib] name）。
+          # 对不上的话只会在手机上跑起来时炸 UnsatisfiedLinkError。
+          SO=../android/app/src/main/jniLibs/arm64-v8a/libdsh_chat_server.so
+          test -f "$SO" || { echo "::error::没有生成 libdsh_chat_server.so"; exit 1; }
+          NM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          if [ -x "$NM" ]; then
+            "$NM" -D "$SO" | grep -q 'Java_com_dangjiyi_dshchat_MainActivity_nativeStart' \
+              || { echo "::error::so 里缺 nativeStart 的 JNI 符号"; exit 1; }
+            "$NM" -D "$SO" | grep -q 'Java_com_dangjiyi_dshchat_MainActivity_nativeLastError' \
+              || { echo "::error::so 里缺 nativeLastError 的 JNI 符号"; exit 1; }
+            echo "JNI 符号检查通过"
+          fi
+
       - name: Resolve versionName
         id: v
         run: |

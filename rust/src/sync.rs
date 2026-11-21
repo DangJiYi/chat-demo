@@ -489,14 +489,11 @@ pub fn discovery_server(store: &'static Store) {
 /// 仍然带上 TLS 连接器：万一用户给对端写了 https://，不至于报
 /// “no TLS backend is configured” 这种看不出原因的错。
 pub(crate) fn lan_agent(timeout: Duration) -> ureq::Agent {
-    let mut builder = ureq::AgentBuilder::new()
+    let builder = ureq::AgentBuilder::new()
         .timeout(timeout)
         .try_proxy_from_env(false)
         .redirects(0);
-    if let Some(tc) = crate::http::tls_connector() {
-        builder = builder.tls_connector(tc);
-    }
-    builder.build()
+    crate::http::with_tls(builder).build()
 }
 
 /// 拉一次对端数据。失败只记录在状态里，不抛错（同步是尽力而为）。

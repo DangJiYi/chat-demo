@@ -157,31 +157,17 @@ fn send_asset(req: Request, data: Vec<u8>, rel: &str) {
 ///   - 有 www 目录（开发、或用 --www 换皮）→ 改前端不用重编 exe
 fn serve_static(req: Request, www: &Path, rel: &str) {
     let rel = if rel.is_empty() { "index.html" } else { rel };
-    // 目录穿越一律拒绝（safe_join 只放行 Normal 段）
-    let Some(mut full) = safe_join(www, rel) else {
-        send_error(req, 403, "forbidden");
-        return;
-    };
-    if full.is_dir() {
-        full = full.join("index.html");
-    }
-    if full.is_file() {
-        return match std::fs::read(&full) {
-            // 目录情形下真正的文件名是 index.html，MIME 要按它算
-            Ok(data) => send_asset(
-                req,
-                data,
-                if full.ends_with("index.html") {
-                    "index.html"
-                } else {
-                    rel
-                },
-            ),
-            Err(e) => send_error(req, 500, &format!("读取失败: {e}")),
-        };
+
+    // www 为空 = 只用内嵌资源（安卓就是这样，前端已在 .so 里）。
+    // 不加这个守卫的话，safe_join 会拼出一个相对路径去查当前工作目录，
+    // 在安卓上属于无意义的文件系统访问。
+    if !www.as_os_str().is_empty() {
+        if let Some(resp) = try_disk(req, www, rel) {
+            return resp;
+        }
     }
 
-    // 磁盘没有 → 内嵌
+    // 磁盘没有（或根本不查磁盘）→ 内嵌
     if let Some(bytes) = crate::assets::lookup(rel) {
         return send_asset(req, bytes.to_vec(), rel);
     }
@@ -193,13 +179,6 @@ fn serve_static(req: Request, www: &Path, rel: &str) {
     }
 
     // SPA fallback：无扩展名的未知路径回退到首页（先磁盘再内嵌）
-    let disk_index = www.join("index.html");
-    if disk_index.is_file() {
-        return match std::fs::read(&disk_index) {
-            Ok(data) => send_asset(req, data, "index.html"),
-            Err(e) => send_error(req, 500, &format!("读取失败: {e}")),
-        };
-    }
     if let Some(bytes) = crate::assets::lookup("index.html") {
         return send_asset(req, bytes.to_vec(), "index.html");
     }
@@ -208,6 +187,56 @@ fn serve_static(req: Request, www: &Path, rel: &str) {
         500,
         "没有可用的界面：www/index.html 缺失，且 exe 内未内嵌前端",
     );
+}
+
+/// 尝试从磁盘回送。返回 `Some(())` 表示已经回应过（含 403/500），
+/// `None` 表示磁盘上没有、应该继续找内嵌资源。
+fn try_disk(req: Request, www: &Path, rel: &str) -> Option<()> {
+    let mut full = match safe_join(www, rel) {
+        Some(p) => p,
+        None => {
+            send_error(req, 403, "forbidden");
+            return Some(());
+        }
+    };
+    if full.is_dir() {
+        full = full.join("index.html");
+    }
+    if !full.is_file() {
+        // 没扩展名的未知路径也回落到磁盘上的 index.html
+        if Path::new(rel).extension().is_none() {
+            let idx = www.join("index.html");
+            if idx.is_file() {
+                return match std::fs::read(&idx) {
+                    Ok(data) => {
+                        send_asset(req, data, "index.html");
+                        Some(())
+                    }
+                    Err(e) => {
+                        send_error(req, 500, &format!("读取失败: {e}"));
+                        Some(())
+                    }
+                };
+            }
+        }
+        return None;
+    }
+    match std::fs::read(&full) {
+        // 目录情形下真正的文件名是 index.html，MIME 要按它算
+        Ok(data) => {
+            let name = if full.ends_with("index.html") {
+                "index.html"
+            } else {
+                rel
+            };
+            send_asset(req, data, name);
+            Some(())
+        }
+        Err(e) => {
+            send_error(req, 500, &format!("读取失败: {e}"));
+            Some(())
+        }
+    }
 }
 
 /// 把 `/db/session/<id>` 拆出 id；`/db/session/<id>/rename` 返回 (id, true)。
@@ -1030,26 +1059,42 @@ const UPSTREAM_HOST: &str = "api.deepseek.com";
 /// 前端 localStorage 里的占位值，表示「用服务端保存的 Key」。
 const KEY_SENTINEL: &str = "__server__";
 
-/// 系统的 TLS 连接器（Windows 走 Schannel），全局只建一次。
+/// 给 agent builder 装上 TLS 后端，按平台分派。
 ///
-/// **必须显式传给 AgentBuilder。** ureq 自己的注释写得清楚：
+/// **必须显式装。** ureq 自己的注释写得清楚：
 /// > native-tls is a feature that must be configured via the AgentBuilder.
 /// > it is never picked up as a default (and never used by `ureq::get` etc).
 ///
-/// 不开 rustls（`tls` 特性）时，默认后端是个只会抛错的 NoTlsConfig，
-/// 所有 HTTPS 请求都返回：
-/// "cannot make HTTPS request because no TLS backend is configured"。
-/// 表现就是聊天、余额、模型列表全部失败——而且看起来像网络问题。
-pub(crate) fn tls_connector() -> Option<std::sync::Arc<ureq::native_tls::TlsConnector>> {
+/// 漏了它，所有 HTTPS 请求会在**运行时**失败：
+/// "cannot make HTTPS request because no TLS backend is configured"，
+/// 表现像网络问题，实际是 TLS 后端没接上。
+///
+/// 分平台的原因：
+/// - 桌面：native-tls（Windows 走 Schannel），跟系统证书库一致、体积小
+/// - 安卓：rustls。native-tls 在安卓要交叉编译 OpenSSL（perl + make + 一堆
+///   NDK 变数），CI 里基本不可能稳定编出来；rustls 是纯 Rust，只是换个 target。
+///   rustls 是 ureq `tls` 特性的默认后端，所以安卓不用再装。
+#[cfg(not(target_os = "android"))]
+pub(crate) fn with_tls(builder: ureq::AgentBuilder) -> ureq::AgentBuilder {
     static CACHE: std::sync::OnceLock<Option<std::sync::Arc<ureq::native_tls::TlsConnector>>> =
         std::sync::OnceLock::new();
-    CACHE
+    let connector = CACHE
         .get_or_init(|| {
             ureq::native_tls::TlsConnector::new()
                 .ok()
                 .map(std::sync::Arc::new)
         })
-        .clone()
+        .clone();
+    match connector {
+        Some(tc) => builder.tls_connector(tc),
+        None => builder,
+    }
+}
+
+/// 安卓：rustls 已经是默认后端，不用装。
+#[cfg(target_os = "android")]
+pub(crate) fn with_tls(builder: ureq::AgentBuilder) -> ureq::AgentBuilder {
+    builder
 }
 
 /// 建一个走系统代理 + 系统 TLS 的 agent（发往上游的请求用）。
@@ -1060,7 +1105,7 @@ pub(crate) fn upstream_agent(
     connect: std::time::Duration,
     read: std::time::Duration,
 ) -> ureq::Agent {
-    let mut builder = ureq::AgentBuilder::new()
+    let builder = ureq::AgentBuilder::new()
         .timeout_connect(connect)
         .timeout_read(read)
         .timeout_write(std::time::Duration::from_secs(60))
@@ -1068,10 +1113,7 @@ pub(crate) fn upstream_agent(
         .try_proxy_from_env(true)
         // 不跟重定向：让调用方看到真实状态码，避免静默改路由
         .redirects(0);
-    if let Some(tc) = tls_connector() {
-        builder = builder.tls_connector(tc);
-    }
-    builder.build()
+    with_tls(builder).build()
 }
 
 /// 把请求转发到上游，**流式**回传响应。
@@ -1600,11 +1642,16 @@ mod tests {
     /// “no TLS backend is configured”，而报错发生在运行时——
     /// 表现是聊天、余额、校验 Key 全部失败，看上去像网络问题。
     ///
-    /// 这个断言不需要联网：只要 TLS 后端能初始化就算通过。
+    /// 安卓不适用（那边是 rustls，没有 TlsConnector 这回事）：
+    /// rustls 的可用性由 ureq 的 `tls` 特性保证。
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn tls_backend_is_configured() {
+        // 能建出 agent 就说明 TLS 后端接上了；
+        // 这里只钉住“不会退到 NoTlsConfig”这一件事。
+        let _agent = with_tls(ureq::AgentBuilder::new()).build();
         assert!(
-            tls_connector().is_some(),
+            ureq::native_tls::TlsConnector::new().is_ok(),
             "native-tls 初始化失败：上游 HTTPS 请求会全部报 no TLS backend"
         );
     }

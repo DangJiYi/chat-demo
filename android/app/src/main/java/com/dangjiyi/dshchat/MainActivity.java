@@ -22,10 +22,6 @@ import android.widget.FrameLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
-import com.chaquo.python.PyObject;
-import com.chaquo.python.Python;
-import com.chaquo.python.android.AndroidPlatform;
-
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -38,11 +34,13 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 
 /**
- * 宿主壳：把 Python 的本地服务拉起来，再用 WebView 加载 127.0.0.1:8790。
+ * 宿主壳：拉起 Rust 写的本地服务（`libdsh_chat.so`），再用 WebView 加载
+ * `http://localhost:8790/`。
  *
- * Python 侧只做两件事需要宿主配合：
- *   1. --data / --www 指向应用私有目录（APK 内部是只读的）；
- *   2. 带 --no-window，别去调 explorer.exe 开浏览器。
+ * 分工：
+ *   - 服务端（HTTP/同步/归档/反向代理）全在 .so 里，见 `rust/src/lib.rs`
+ *   - 前端已内嵌进 .so，这里不再解压 assets
+ *   - 本类只负责：加载 .so、传数据目录与端口、轮询就绪、装 WebView
  */
 public class MainActivity extends Activity {
 
@@ -50,7 +48,8 @@ public class MainActivity extends Activity {
     // 必须用主机名 localhost，不能用 IP：
     // Android 的 network-security-config 里 <domain> 只接受主机名，
     // 写 127.0.0.1 会被静默忽略 → 明文被拦 → WebView 白屏。
-    // 代价是 localhost 可能解析到 ::1，所以 Python 侧同时监听 IPv4/IPv6。
+    // 代价是 localhost 可能解析到 ::1，所以服务端同时监听 IPv4/IPv6
+    // （见 rust/src/lib.rs 的 serve：127.0.0.1 必须成功，[::1] 尽力而为）。
     private static final String HOST = "localhost";
     private static final int PORT = 8790;
     private static final long BOOT_TIMEOUT_MS = 30_000L;
@@ -60,10 +59,21 @@ public class MainActivity extends Activity {
     // 盖在 WebView 上面的诊断遮罩；成功加载后必须整个隐藏，否则会吃掉所有触摸
     private ScrollView overlay;
     private final StringBuilder diag = new StringBuilder();
-    // Python 服务启动时的异常/日志，失败时展示到界面上
-    private volatile String pyError = null;
-    // Python 解释器和 server 线程是进程级的；Activity 重建时不能重复启动
+    // Rust 服务启动失败的原因（从 native 侧读回来），失败时展示到界面上
+    private volatile String bootError = null;
+    // 服务和线程是进程级的；Activity 重建时不能重复启动
     private static volatile boolean sBooted = false;
+
+    /**
+     * Rust 服务。`.so` 由 cargo-ndk 交叉编译产出，见 `rust/src/jni.rs`。
+     *
+     * nativeStart 只负责把服务线程拉起来（立即返回），错误通过
+     * nativeLastError 回传——轮询循环一旦拿到错误就立刻停，
+     * 不用把真正的原因埋在一句「30 秒超时」里。
+     */
+    private native int nativeStart(String dataDir, int port);
+
+    private native String nativeLastError();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -143,15 +153,15 @@ public class MainActivity extends Activity {
 
     private void boot() {
         try {
-            setStatus("正在解压前端资源…");
+            setStatus("正在准备数据目录…");
             extractAssets();
             if (sBooted) {
                 // 服务已经在跑（Activity 重建），直接等它就绪即可
                 setStatus("正在等待本地服务…");
                 waitForServer(BOOT_TIMEOUT_MS);
             } else {
-                setStatus("正在启动 Python 服务…");
-                startPython();
+                setStatus("正在启动本地服务…");
+                startNative();
                 setStatus("正在等待本地服务就绪…");
                 waitForServer(BOOT_TIMEOUT_MS);
                 sBooted = true;
@@ -179,9 +189,9 @@ public class MainActivity extends Activity {
         sb.append("启动失败：").append(t).append("\n\n");
         sb.append("地址：http://").append(HOST).append(':').append(PORT).append("/\n");
         sb.append("数据：").append(dataDir().getAbsolutePath()).append("\n");
-        sb.append("静态：").append(wwwDir().getAbsolutePath()).append("\n");
-        if (pyError != null) {
-            sb.append("\n--- Python 错误 ---\n").append(pyError);
+        sb.append("静态：内嵌于 libdsh_chat.so\n");
+        if (bootError != null) {
+            sb.append("\n--- 启动错误 ---\n").append(bootError);
         }
         String appLog = tailAppLog(40);
         if (!appLog.isEmpty()) {
@@ -273,19 +283,7 @@ public class MainActivity extends Activity {
         });
     }
 
-    // ---------------------------------------------------------------- 静态资源
-
-    /**
-     * 当前版本的解压目录：www-&lt;stamp&gt;。
-     *
-     * 不要用固定的 "www"：deleteTree 删不掉某些文件时会静默残留，
-     * 每装一次新版就多积一份 3.4 MB，攒几次就变成 17 MB——这正是之前
-     * “界面文件 17.8 MB” 的来源。用版本化目录后，新目录总是干净的，
-     * 旧目录删不掉也影响不到运行。
-     */
-    private File wwwDir() {
-        return new File(getFilesDir(), "www-" + appStamp());
-    }
+    // ---------------------------------------------------------------- 私有目录
 
     private File dataDir() {
         return new File(getFilesDir(), "data");
@@ -296,30 +294,14 @@ public class MainActivity extends Activity {
      * 所以升级后一定是全新目录，并顺手清掉旧版本残留。
      */
     private void extractAssets() throws IOException {
-        File target = wwwDir();
-        // 目录已完整（上次解压成功）就直接用
-        if (new File(target, "index.html").isFile()) {
-            pruneOldWww(target);
-            ensureDataDir();
-            return;
-        }
-        deleteTree(target);
-        if (!target.isDirectory() && !target.mkdirs()) {
-            throw new IOException("无法创建目录 " + target);
-        }
-        copyAssetDir("", target);
-        // 解压完整性自检：缺 index.html 说明中途失败，不能当成功
-        if (!new File(target, "index.html").isFile()) {
-            throw new IOException("解压未完成：" + target + "/index.html 不存在");
-        }
-        // 自检：期望约 60 个文件（111 个资产中的 static 子树）。
-        // 明显偏大说明白名单失效，又把 WebView 的资产拷进来了。
-        int files = countFiles(target);
-        Log.i(TAG, "前端解压完成：" + files + " 个文件 -> " + target);
-        if (files > 200) {
-            Log.w(TAG, "文件数异常偏大（" + files + "），白名单可能失效");
-        }
-        pruneOldWww(target);
+        // 前端已经内嵌在 .so 里（`rust/build.rs` 把 `www/` 编进二进制），
+        // 不再需要从 assets 解压到私有目录：
+        //   - 省掉那 3.4 MB 的重复占用（系统会把它算进“用户数据”）
+        //   - 省掉每次升级后的一次性拷贝
+        //   - 顺带消掉“白名单抄错就把 14 MB WebView 资产拷进来”的整个风险面
+        //
+        // 下面的 copyAssetDir / pruneOldWww 等方法暂时保留（已无调用点），
+        // 等这版跑通再一并清理——一次只改一件事。
         ensureDataDir();
     }
 
@@ -365,7 +347,9 @@ public class MainActivity extends Activity {
      * 只用 versionCode 的话，重装同一个 versionCode 的包不会重新解压，
      * 修好的 assets 永远进不了设备——这是个很难查的坑。
      */
-    /** 缓存一份：wwwDir() 每次调用都会走这里，不必反复问 PackageManager。 */
+    /** 缓存一份：应用版本戳只查一次，不必反复问 PackageManager。
+     *  目前没有调用点（前端已内嵌，不再需要版本化目录），
+     *  等这版跑通后随 copyAssetDir 一起清掉。 */
     private volatile String cachedStamp;
 
     private String appStamp() {
@@ -481,32 +465,46 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ---------------------------------------------------------------- Python
+    // ---------------------------------------------------------------- Rust 服务
 
-    private void startPython() {
-        if (!Python.isStarted()) {
-            Python.start(new AndroidPlatform(getApplicationContext()));
+    /** 加载 .so 的结果。只试一次：失败就记下原因，不要反复试。 */
+    private static boolean sLibLoaded = false;
+    private static String sLibError = null;
+
+    private static synchronized void loadLib() {
+        if (sLibLoaded || sLibError != null) {
+            return;
         }
-        Python py = Python.getInstance();
-        PyObject server = py.getModule("server");
+        try {
+            // 名字必须与 rust/Cargo.toml 里 [lib] name 一致：
+            // 那个 name 决定产出的文件名 libdsh_chat_server.so。
+            // 写错的话运行时才报 UnsatisfiedLinkError，很难查。
+            System.loadLibrary("dsh_chat_server");
+            sLibLoaded = true;
+        } catch (Throwable t) {
+            // 不把 loadLibrary 放在 static 块里：那样一失败就是
+            // UnsatisfiedLinkError 直接杀进程，连诊断界面都看不到。
+            sLibError = Log.getStackTraceString(t);
+        }
+    }
 
-        // 不要往 sys.argv 里塞 String[]：Chaquopy 把它转成 jarray，
-        // 不是真正的 list，argparse 内部调 list.remove() 会抛 AttributeError。
-        // server.run_android() 收普通字符串参数，在 Python 侧拼 argv。
-        final String dataPath = dataDir().getAbsolutePath();
-        final String wwwPath = wwwDir().getAbsolutePath();
-
-        Thread t = new Thread(() -> {
-            try {
-                // serve_forever 会一直阻塞，所以必须在后台线程里跑
-                server.callAttr("run_android", dataPath, wwwPath, PORT);
-            } catch (Throwable e) {
-                pyError = Log.getStackTraceString(e);
-                Log.e(TAG, "server 退出", e);
-            }
-        }, "dsh-server");
-        t.setDaemon(true);
-        t.start();
+    private void startNative() {
+        loadLib();
+        if (sLibError != null) {
+            bootError = "加载 libdsh_chat.so 失败：\n" + sLibError;
+            Log.e(TAG, bootError);
+            return;
+        }
+        // 前端已内嵌在 .so 里，只传数据目录和端口
+        int rc = nativeStart(dataDir().getAbsolutePath(), PORT);
+        if (rc != 0) {
+            String detail = nativeLastError();
+            bootError = "启动本地服务失败（nativeStart=" + rc + "）"
+                    + (detail == null ? "" : "：\n" + detail);
+            Log.e(TAG, bootError);
+            return;
+        }
+        Log.i(TAG, "已请求启动 Rust 服务，等待就绪…");
     }
 
     private void waitForServer(long timeoutMs) throws IOException {
@@ -514,9 +512,9 @@ public class MainActivity extends Activity {
         IOException last = null;
         String[] probes = {"127.0.0.1", "localhost"};
         while (System.currentTimeMillis() < deadline) {
-            // Python 侧可能崩了，不用白等到超时
-            if (pyError != null) {
-                throw new IOException("Python 服务已退出");
+            // native 侧可能已经报错，不用白等到超时
+            if (bootError != null) {
+                throw new IOException("本地服务已退出");
             }
             for (String host : probes) {
                 HttpURLConnection conn = null;

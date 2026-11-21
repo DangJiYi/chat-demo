@@ -8,6 +8,15 @@ description = "dsh-chat 本地服务（Rust 重写，逐步替代 server.py）"
 name = "dsh-chat"
 path = "src/main.rs"
 
+# 同一个 crate 既是命令行程序（Windows）又是动态库（安卓 .so）。
+#
+# 安卓没有“双击运行”这回事：Java 侧 System.loadLibrary 加载 .so，
+# 再通过 JNI 调进去把服务器跑起来，WebView 加载 127.0.0.1。
+# cdylib 是 JNI 的前提，所以这里必须生成 .so。
+[lib]
+name = "dsh_chat_server"
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 # 同步 HTTP，不引 tokio：并发上限就是「一个 WebView + 一个同步端口」
 tiny_http = "0.12"
@@ -17,18 +26,32 @@ serde_json = "1"
 sha2 = "0.10"
 # 归档是 .jsonl.gz，搜索和归档去重都要解压
 flate2 = "1"
-# 只有 /local/balance 需要出站 HTTPS（查余额）。
-# default-features=false 是为了排除默认的 rustls（约 +1.5 MB）；
-# native-tls 在 Windows 上用 Schannel、Linux/macOS 用系统 OpenSSL，体积小得多。
-# json 特性提供 into_json()，测试和余额解析都要用。
-# proxy-from-env：默认读 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY。
-# Python 版的 urllib 本来就会读这些变量，不开的话同一台机器上
-# “Python 版能查余额、Rust 版报网络错”这种差异会让人找不出原因。
+
+# TLS 后端分平台，原因很具体：
+#
+#  - Windows / Linux / macOS 用 **native-tls**：走系统实现（Schannel /
+#    OpenSSL），体积小、跟系统证书库一致。
+#  - 安卓用 **rustls**：native-tls 在安卓上要交叉编译 OpenSSL（要 perl、make、
+#    还有一堆 NDK 变数），几乎不可能在 CI 里稳定编出来；
+#    rustls 是纯 Rust，交叉编译就是换个 target 而已。
+#    代价是证书根用 webpki-roots（随二进制内置），约 +1.5 MB。
+#
+# proxy-from-env：读 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY，与 Python 版一致。
+[target.'cfg(not(target_os = "android"))'.dependencies]
 ureq = { version = "2", default-features = false, features = [
     "native-tls",
     "json",
     "proxy-from-env",
 ] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ureq = { version = "2", default-features = false, features = [
+    "tls",
+    "json",
+    "proxy-from-env",
+] }
+# JNI 绑定。只在安卓编译，其他平台完全不会引入。
+jni = "0.21"
 
 # 托盘图标：只用系统 API，不引 GUI 框架。
 #

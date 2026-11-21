@@ -1,13 +1,4 @@
 pluginManagement {
-    // Chaquopy 不一定发布 Gradle 插件标记（plugin marker），
-    // 直接把它映射到官方 Maven 坐标，避免 "Plugin not found"。
-    resolutionStrategy {
-        eachPlugin {
-            if (requested.id.id == 'com.chaquo.python') {
-                useModule("com.chaquo.python:gradle:${requested.version}")
-            }
-        }
-    }
     repositories {
         google()
         mavenCentral()

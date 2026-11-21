@@ -1,13 +1,13 @@
 plugins {
     id 'com.android.application'
-    id 'com.chaquo.python'
 }
 
-// Python 源码放在 Chaquopy 的默认目录 src/main/python/server.py。
+// 后端是 Rust，不再是 Python：
+//   rust/ 交叉编译成 arm64-v8a 的 libdsh_chat.so，放进 src/main/jniLibs/
+//   MainActivity 用 System.loadLibrary("dsh_chat") 加载，再通过 JNI 起服务。
 //
-// 不在这里做"构建时从 server/ 复制"：syncServerPy 会把 src/main/python 同时作为
-// 任务输出和 Chaquopy 的输入，Gradle 判定为隐式依赖并直接拒绝构建。
-// 两份副本的一致性由 CI 的 diff 步骤保证（不同步会直接失败）。
+// .so 不由 Gradle 编译（没有 CMake/ndk-build 配置），而是 CI 里用 cargo-ndk 产出后
+// 拷进 src/main/jniLibs/arm64-v8a/。本地出包时同理，见 chat/BUILD.md。
 
 android {
     namespace 'com.dangjiyi.dshchat'
@@ -17,26 +17,20 @@ android {
         applicationId 'com.dangjiyi.dshchat'
         minSdk 24
         targetSdk 34
-        versionCode 23
-        // CI 里用 -PversionName=v0.2.0 注入；本地构建用默认值
-        versionName (project.findProperty('versionName') ?: '0.2.0')
+        versionCode 24
+        // CI 里用 -PversionName=v0.2.x 注入；本地构建用默认值
+        versionName (project.findProperty('versionName') ?: '0.2.3')
 
-        // 只出 arm64-v8a：Chaquopy 的 libpython 每个 ABI 各一份，
-        // 带上 armeabi-v7a 等于把 native 部分翻倍。
-        // 2020 年后的安卓手机基本都是 arm64；要兼容 32 位老机器就改回
-        // abiFilters 'arm64-v8a', 'armeabi-v7a'
+        // 只出 arm64-v8a。
+        // 2020 年后的安卓手机基本都是 arm64；要兼容 32 位老机器就加 'armeabi-v7a'
+        // ——代价是 .so 再来一份。
         ndk {
             abiFilters 'arm64-v8a'
         }
     }
 
-    sourceSets {
-        main {
-            // 前端静态站平铺进 assets 根；MainActivity 启动时复制到私有目录
-            // Python 源码在默认位置 src/main/python（见文件顶部说明）
-            assets.srcDir '../../www'
-        }
-    }
+    // 不再需要 sourceSets.assets：前端已经由 rust/build.rs 编进 .so，
+    // APK 里不放 www/，也就不需要在启动时解压 3.4 MB 到私有目录。
 
     buildTypes {
         debug {
@@ -51,8 +45,8 @@ android {
     packagingOptions {
         // extractNativeLibs=false：.so 不再解压到应用目录，直接从 APK 内加载。
         //
-        // 代价：APK 里的 .so 必须不压缩（体积约 +4 MB 下载量）。
-        // 收益：手机上不再保留一份解压出来的副本（约 -7 MB 占用）。
+        // 代价：APK 里的 .so 必须不压缩（下载量略大）。
+        // 收益：手机上不再保留一份解压出来的副本。
         // 你关心的是“手机里占多少”，所以选这个。
         jniLibs {
             useLegacyPackaging false
@@ -64,9 +58,6 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 }
-
-// 不写 python { } 块：server.py 只用标准库，没有 pip 依赖，
-// buildPython 用 Chaquopy 的默认值（Linux 上是 python3，runner 自带）。
 
 dependencies {
 }

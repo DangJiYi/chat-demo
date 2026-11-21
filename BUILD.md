@@ -5,8 +5,9 @@
 ```text
 src/            前端源码（React + rspack）
 www/            前端预构建产物（src 的 dist，随包发布；与 python 版一致）
-server/         Python 本地服务（server.py + PyInstaller 配置）
-android/        Chaquopy 安卓壳（把 server.py + www 打进 APK）
+server/         Python 本地服务（旧实现，已由 rust/ 替代）
+rust/           Rust 本地服务（Windows exe + 安卓 .so，同一份代码）
+android/        安卓壳：加载 libdsh_chat_server.so + WebView（不再有 Python）
 ```
 
 ## 改前端之后要重建 www
@@ -221,7 +222,7 @@ Python 版的做法是分发前统一剥掉 `/local`，于是 `/local/db/summari
 之前的 CI 全打 `/db/*`，所以这件事一路绿着进了产物。
 `tests/smoke.rs` 的 `frontend_local_db_prefix_is_served` 现在直接按前端真实路径断言。
 
-还差：安卓壳（`cargo-ndk` + 薄 Kotlin 层）。
+Windows 侧已与 Python 版对齐；安卓也换成同一份 Rust 代码（见下文「安卓壳」）。
 
 ### 计费口径与测试
 
@@ -465,37 +466,52 @@ cd android && gradle assembleDebug
 
 ### 安卓壳做了什么
 
-1. 首次启动把 `assets` 里的 `www/` 解压到应用私有目录（APK 内部只读）。
-2. 用 Chaquopy 启动 `server.py`，参数为
-   `--no-window --data <filesDir>/data --www <filesDir>/www --port 8790`。
-3. 轮询 `/local/status`，就绪后用 WebView 加载 `http://127.0.0.1:8790/`。
+安卓已经没有 Python 了。现在是一个 .so + 一层 WebView：
+
+1. `rust/` 交叉编译成 `libdsh_chat_server.so`（arm64-v8a），
+   由 CI 的 `cargo ndk` 产出后拷进 `android/app/src/main/jniLibs/arm64-v8a/`。
+2. `MainActivity` 里 `System.loadLibrary("dsh_chat_server")`，
+   再调 `nativeStart(dataDir, 8790)`。
+3. native 侧起一个线程跑 `serve()`（阻塞在请求循环里，不能占 Java 主线程），
+   立即返回；Java 侧轮询 `/local/status`。
+4. 就绪后用 WebView 加载 `http://localhost:8790/`。
+
+**前端不再放 assets。** `rust/build.rs` 把 `www/` 编进 .so，服务端直接从
+内嵌资源回送。好处：
+
+- 省掉私有目录里那 3.4 MB 解压副本（系统会把它算进“用户数据”）
+- 省掉每次升级后的一次性拷贝
+- 整个“资产白名单”的风险面消失（以前一旦白名单失效就把 WebView 的
+  14 MB 运行资产拷进来，界面文件从 3.4 MB 虚增到 17.8 MB）
+
+**两个安卓特有的约束，别踩回去：**
+
+- `network-security-config` 的 `<domain>` **只接受主机名**，写 `127.0.0.1`
+  会被静默忽略 → 明文被拦 → WebView 白屏。所以用 `localhost`。
+- 代价是 `localhost` 可能解析到 `::1`，服务端必须 **同时监听 127.0.0.1 和 [::1]**。
+  `lib.rs` 里 IPv4 是硬要求（绑不上就退出），IPv6 尽力而为（绑不上就算了）。
+  只绑 IPv4 就是那个“打开全空白”的根因。
+
+**TLS 也必须分平台**：安卓不能用 `native-tls`（要交叉编译 OpenSSL，
+CI 里基本不可能稳定编出来），所以 `Cargo.toml` 按 target 分开：
+桌面用 `native-tls`，安卓用 `rustls`（纯 Rust，只是换个 target）。
+入口统一在 `http::with_tls()`。
 
 ### 目录约定
 
-`server.py` 在仓库里有两份，内容必须完全一致：
+安卓已经不用 Python 了，但 `server.py` 仍在仓库里留了两份（旧实现，保留作对照）：
 
 ```text
-server/server.py                          Windows 打包用（PyInstaller）
-android/app/src/main/python/server.py     Chaquopy 只认这个默认目录
+server/server.py                          Windows 旧实现（PyInstaller）
+android/app/src/main/python/server.py     Chaquopy 时代的副本
 ```
 
-**为什么不在构建时自动复制**：试过用 Gradle 的 `syncServerPy` 任务在 `preBuild` 前复制，
-但 `src/main/python` 会同时成为该任务的输出和 Chaquopy 的输入，Gradle 判定为隐式依赖
-并直接拒绝构建（`implicit_dependency`）。所以保留两份提交，用 CI 的 `diff` 步骤防漂移。
+两份仍然由 CI 的 `Check server.py copies are in sync` 步骤保证一致。
+**它们已经不参与构建**：`android/app/build.gradle` 里没有 Chaquopy 插件，
+`src/main/python` 不会被 AGP 打进 APK；Windows 侧也改用 `rust/`。
 
-**改了 `server/server.py` 后，记得同步 Android 那份：**
-
-```bash
-cp server/server.py android/app/src/main/python/server.py
-```
-
-漏了会怎样：CI 的 `Check server.py copies are in sync` 步骤直接失败，不会静默放过。
-
-`android/app/build.gradle` 里没有 `python { }` 块：`server.py` 只用标准库，
-没有 pip 依赖，`buildPython` 用 Chaquopy 的默认值即可。
-
-`server/tray.py` 不需要同步——它只在 Windows 上用。Android 上 `start_tray()`
-在 `sys.platform != "win32"` 时直接返回 `None`，不会去 import 它。
+所以：改 Rust 后端时**不用**动 `server.py`；改 `server.py` 仍然要同步两份，
+否则那个 diff 步骤会让 CI 失败。等 Rust 版彻底稳定后可以整包删掉。
 
 ### APK 体积
 
