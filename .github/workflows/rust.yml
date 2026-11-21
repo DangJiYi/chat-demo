@@ -195,8 +195,13 @@ jobs:
             $left = (Get-ChildItem 'data\staged\sessions' -ErrorAction SilentlyContinue).Count
             if ($left -ne 0) { throw "暂存会话未清空，剩 $left" }
 
+            # 附件是 image/png，PowerShell 不会把它解码成文本，
+            # $g2.Content 是 byte[]，要先转字符串再比。
             $g2 = Invoke-WebRequest -Uri 'http://127.0.0.1:8799/db/file/sf1' -TimeoutSec 5
-            if ($g2.Content -ne 'staged-file') { throw "导入的附件读不回来: $($g2.Content)" }
+            $g2text = if ($g2.Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($g2.Content) } else { [string]$g2.Content }
+            if ($g2text -ne 'staged-file') { throw "导入的附件读不回来: $g2text" }
+            # 导入时带的 MIME 必须保留（否则“压缩图片”认不出它是图片）
+            if ($g2.Headers['Content-Type'] -notmatch 'image/png') { throw "导入附件的 MIME 丢失: $($g2.Headers['Content-Type'])" }
 
             Write-Host '自检通过'
           } finally {
