@@ -259,7 +259,10 @@ fn session_crud_and_tombstone() {
     assert_file(&s.data(), "sessions/s9.json");
     let tomb: serde_json::Value =
         serde_json::from_slice(&std::fs::read(s.data().join("sessions/s9.json")).unwrap()).unwrap();
-    assert_eq!(tomb["deleted"], true, "应写入墓碑标记");
+    assert!(
+        tomb["deleted"].as_bool().unwrap_or(false),
+        "应写入墓碑标记"
+    );
 
     // 墓碑不出现在列表里
     let list: Vec<serde_json::Value> = ureq::get(&s.url("/db/summaries"))
@@ -400,7 +403,10 @@ fn apikey_lifecycle_and_hint() {
         .unwrap()
         .into_json()
         .unwrap();
-    assert_eq!(st["configured"], false, "初始不应有 Key");
+    assert!(
+        !st["configured"].as_bool().unwrap_or(true),
+        "初始不应有 Key"
+    );
 
     // 用一个明显不是真凭据的字符串，只验证格式与存储位置
     let resp: serde_json::Value = ureq::put(&s.url("/local/apikey"))
@@ -409,7 +415,7 @@ fn apikey_lifecycle_and_hint() {
         .unwrap()
         .into_json()
         .unwrap();
-    assert_eq!(resp["configured"], true);
+    assert!(resp["configured"].as_bool().unwrap_or(false), "存 Key 后应 configured=true");
     assert_eq!(resp["hint"], "…0000", "hint 只露末 4 位");
     assert_file(&s.data(), "meta/secret.json");
 
@@ -429,7 +435,10 @@ fn apikey_lifecycle_and_hint() {
         .unwrap()
         .into_json()
         .unwrap();
-    assert_eq!(st2["configured"], false, "删除后应回到未配置");
+    assert!(
+        !st2["configured"].as_bool().unwrap_or(true),
+        "删除后应回到未配置"
+    );
 }
 
 // ------------------------------------------------------------------ 聚合

@@ -44,6 +44,22 @@ pub fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// 本机名：优先环境变量，取不到就用固定串。
+///
+/// std 没有 getaddrinfo/gethostname 的可移植封装，为这一处引 libc 不值得。
+/// 这个值只用作「发现列表里的默认显示名」，用户随时可以改，不算准确无妨。
+pub fn hostname() -> String {
+    for key in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    "dsh-chat".to_string()
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

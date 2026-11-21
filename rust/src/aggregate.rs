@@ -147,7 +147,8 @@ pub fn delete_archived(store: &Store, sid: &str) -> Result<bool, String> {
         return Ok(false);
     }
     // 墓碑：同步时告诉对端“这条删了”，否则对端会把旧归档又推回来
-    if !idx.get("archiveDeleted").map(|v| v.is_array()).unwrap_or(false) {
+    let has_tomb = matches!(idx.get("archiveDeleted"), Some(v) if v.is_array());
+    if !has_tomb {
         idx["archiveDeleted"] = serde_json::json!([]);
     }
     if let Some(tomb) = idx.get_mut("archiveDeleted").and_then(|v| v.as_array_mut()) {
@@ -250,7 +251,9 @@ pub fn usage(store: &Store, session_id: &str) -> UsageResponse {
                 .unwrap_or(now);
             let cost = billing::cost_of(model, ts, hit, miss, out);
             let factor = if billing::is_peak(ts) { 1.0 } else { 0.5 };
-            let (ph, pm, _) = match model {
+            // 只需要「命中」与「未命中」两个单价来算缓存省下多少；
+            // 输出单价不参与，不要解构它（之前多写了一个 _ 导致元组长度不符）
+            let (ph, pm) = match model {
                 "deepseek-v4-pro" => (0.30, 9.00),
                 _ => (0.04, 2.00),
             };
@@ -446,7 +449,7 @@ pub fn search(store: &Store, query: &str, limit: usize) -> SearchResponse {
         }
     }
 
-    hits.sort_by(|a, b| b.ts.cmp(&a.ts));
+    hits.sort_by_key(|h| std::cmp::Reverse(h.ts));
     hits.truncate(limit);
     SearchResponse {
         query: query.to_string(),

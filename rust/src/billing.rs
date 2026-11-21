@@ -65,13 +65,13 @@ fn weekday(ms: i64) -> u32 {
 
 /// YYYY-MM-DD，用于查节假日表与按日/按月分桶。
 pub fn bj_date_key(ms: i64) -> String {
-    let (y, m, d) = bj_parts(ms);
+    let (y, m, d, _, _) = bj_parts(ms);
     format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// YYYY-MM，用于按月分桶。
 pub fn bj_month_key(ms: i64) -> String {
-    let (y, m, _) = bj_parts(ms);
+    let (y, m, _, _, _) = bj_parts(ms);
     format!("{y:04}-{m:02}")
 }
 

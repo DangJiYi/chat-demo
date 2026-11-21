@@ -3,8 +3,10 @@
 //! 契约必须与 Python 版完全一致：前端 `src/local/api.ts` 与
 //! `src/services/chat/db.ts` 不改一行。
 //!
-//! 已实现：静态文件、/local/status、/health、/db/summaries、
-//!         /db/session/<id> 的 GET/PUT/DELETE、/db/session/<id>/rename
+//! 已实现：静态文件、/local/*（status/storage/config/apikey/usage/balance/
+//!         search/archived/restore/delete）、/db/*（summaries/session/file/staging）
+//!
+//! 还差：同步端口 8791、UDP 发现 8792、/local/discover 与 /local/pair*、安卓壳。
 
 mod aggregate;
 mod billing;
