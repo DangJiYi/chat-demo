@@ -30,7 +30,9 @@ use tiny_http::Server;
 
 use store::Store;
 
-const VERSION: &str = "0.2.0";
+/// 版本号。**改功能就递增**：排查时靠它确认对方装的到底是哪个构建，
+/// 不然「改了但没生效」和「根本没改」看起来一模一样。
+const VERSION: &str = "0.2.1";
 
 struct Args {
     port: u16,
@@ -203,7 +205,9 @@ fn main() {
             }
             thread::spawn(move || {
                 for request in s.incoming_requests() {
-                    http::handle_sync(request, store, VERSION);
+                    // 每个请求一个线程：附件下载、对端拉取都可能慢，
+                    // 串行处理会让一个慢请求堵住其他所有请求。
+                    thread::spawn(move || http::handle_sync(request, store, VERSION));
                 }
             });
             port
@@ -258,7 +262,16 @@ fn main() {
         }
     }
 
+    // 每个请求单独一个线程。
+    //
+    // 这不是“为了并发而并发”：聊天走 SSE，一次回答可能持续几分钟，
+    // 而代理是流式的，`handle()` 会一直阻塞到流结束。串行处理的话，
+    // 正在出字的时候，自动保存会话（PUT /db/session/...）、
+    // 侧边栏状态查询（/local/status）全部卡住——
+    // 表现就是「一提问整个界面就死了」。
+    let www = std::sync::Arc::new(www);
     for request in server.incoming_requests() {
-        http::handle(request, store, &www, VERSION);
+        let www = std::sync::Arc::clone(&www);
+        thread::spawn(move || http::handle(request, store, www.as_path(), VERSION));
     }
 }

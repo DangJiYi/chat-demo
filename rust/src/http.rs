@@ -68,15 +68,23 @@ fn send_no_content(req: Request) {
 
 /// 读请求体，超过上限直接报错。
 fn read_body(req: &mut Request) -> Result<Vec<u8>, String> {
+    read_body_upto(req, MAX_BODY)
+}
+
+/// 读请求体，上限可指定（转发附件上传时要比会话大得多）。
+fn read_body_upto(req: &mut Request, limit: u64) -> Result<Vec<u8>, String> {
     let len = req.body_length().unwrap_or(0) as u64;
-    if len > MAX_BODY {
+    if len > limit {
         return Err("请求体过大".into());
     }
-    let mut buf = Vec::with_capacity(len as usize);
+    let mut buf = Vec::with_capacity(len.min(1 << 20) as usize);
     req.as_reader()
-        .take(MAX_BODY + 1)
+        .take(limit + 1)
         .read_to_end(&mut buf)
         .map_err(|e| format!("读取请求体失败: {e}"))?;
+    if buf.len() as u64 > limit {
+        return Err("请求体过大".into());
+    }
     Ok(buf)
 }
 
@@ -933,12 +941,204 @@ pub fn handle(mut req: Request, st: &'static Store, www: &Path, version: &str) {
         return;
     }
 
+    // ---------- 反向代理：/models、/anthropic/*、/v1/* ----------
+    //
+    // 本地构建时前端**不直连上游**（`__API_ORIGIN__` 为空，见 rspack.config.ts）：
+    // 聊天、附件上传、语音合成、Key 校验全部走同源请求，由这里转发到
+    // api.deepseek.com 并注入存在服务端的 Key。
+    //
+    // 少了这一段，界面表现是「无法对话」：请求发到同源路径，服务端只认
+    // /local/* 和 /db/*，于是回 404 {"error":"not found"}，前端把它当成
+    // 上游错误，提示「API Key 无效或已被删除」——与真实原因毫无关系。
+    if is_proxy_path(&path) {
+        // Method 没有 Copy，用 PartialEq 判断，避免把 method 移走（后面还要用）
+        let allowed = method == Method::Get
+            || method == Method::Post
+            || method == Method::Put
+            || method == Method::Delete;
+        if allowed {
+            proxy(req, &url, st);
+        } else {
+            send_error(req, 404, "not found");
+        }
+        return;
+    }
+
     // ---------- 其余交给静态文件 ----------
     if method == Method::Get {
         serve_static(req, www, path.trim_start_matches('/'));
     } else {
         send_error(req, 404, "not found");
     }
+}
+
+/// 前端在本地模式下会请求这些同源路径，由服务端转发到上游。
+///
+/// 与 Python 版的 `UIServer.dispatch` 保持一致：`/models`、`/anthropic/*`、`/v1/*`。
+fn is_proxy_path(path: &str) -> bool {
+    path == "/models"
+        || path.starts_with("/models/")
+        || path.starts_with("/anthropic/")
+        || path.starts_with("/v1/")
+}
+
+/// 上游主机。余额、聊天、模型列表都是它。
+const UPSTREAM_HOST: &str = "api.deepseek.com";
+/// 前端 localStorage 里的占位值，表示「用服务端保存的 Key」。
+const KEY_SENTINEL: &str = "__server__";
+
+/// 把请求转发到上游，**流式**回传响应。
+///
+/// 必须流式：聊天走 SSE，如果先收完整个响应再返回，界面要等到回答结束
+/// 才会出现文字，流式体验全没了。
+fn proxy(mut req: Request, url: &str, st: &Store) {
+    let method = req.method().clone();
+
+    // 只挑需要的头：不盲目透传 Host/Content-Length/Expect 这些
+    let mut in_key = String::new();
+    let mut in_auth = String::new();
+    let mut content_type = String::new();
+    let mut accept = String::new();
+    let mut anth_beta = String::new();
+    for h in req.headers() {
+        if h.field.equiv("x-api-key") {
+            in_key = h.value.as_str().trim().to_string();
+        } else if h.field.equiv("authorization") {
+            in_auth = h.value.as_str().trim().to_string();
+        } else if h.field.equiv("content-type") {
+            content_type = h.value.as_str().to_string();
+        } else if h.field.equiv("accept") {
+            accept = h.value.as_str().to_string();
+        } else if h.field.equiv("anthropic-beta") {
+            anth_beta = h.value.as_str().to_string();
+        }
+    }
+
+    // 凭据优先级：浏览器带来的真凭据 > 服务端保存的 Key。
+    //
+    // 哨兵值不算凭据。这一步很关键：verifyApiKey() 只带 Authorization、
+    // 不带 x-api-key，若按「任一为空就用服务端 Key」判定，
+    // 验证新 Key 时会被旧 Key 顶替，用户永远验证不过、也换不掉 Key。
+    let sentinel_auth = format!("Bearer {KEY_SENTINEL}");
+    let in_key = if in_key == KEY_SENTINEL {
+        String::new()
+    } else {
+        in_key
+    };
+    let in_auth = if in_auth == sentinel_auth {
+        String::new()
+    } else {
+        in_auth
+    };
+
+    let (out_key, out_auth) = if !in_key.is_empty() || !in_auth.is_empty() {
+        (in_key, in_auth)
+    } else {
+        let server_key = st.api_key();
+        if server_key.is_empty() {
+            // 把 "__server__" 发给上游会得到一个语焉不详的 401（“Key 无效”），
+            // 让人以为 Key 失效了，实际是没配置。
+            send_error(
+                req,
+                400,
+                "服务端尚未配置 API Key：请先在设置里填入（保存在 data/meta/secret.json）",
+            );
+            return;
+        }
+        let auth = format!("Bearer {server_key}");
+        (server_key, auth)
+    };
+
+    // 上传附件（/anthropic/v1/files）比会话大得多，用附件上限
+    let body = if method == Method::Get {
+        Vec::new()
+    } else {
+        match read_body_upto(&mut req, 128 << 20) {
+            Ok(b) => b,
+            Err(e) => {
+                send_error(req, 413, &e);
+                return;
+            }
+        }
+    };
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        // 读超时按“多久没收到数据”算，聊天流只要还在出字就不会被切断
+        .timeout_read(std::time::Duration::from_secs(600))
+        .timeout_write(std::time::Duration::from_secs(60))
+        // 跟 Python 版一致：读 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY。
+        // 用系统代理的用户，不读这两个变量的话所有请求都直连——
+        // 表现就是“浏览器能用、客户端不能用”。
+        .try_proxy_from_env(true)
+        // 不跟重定向：上游若有跳转，交给前端看到真实状态码，避免静默改路由
+        .redirects(0)
+        .build();
+
+    let target = format!("https://{UPSTREAM_HOST}{url}");
+    let mut call = agent.request(method.as_str(), &target);
+    if !out_key.is_empty() {
+        call = call.set("x-api-key", &out_key);
+    }
+    if !out_auth.is_empty() {
+        call = call.set("Authorization", &out_auth);
+    }
+    if !content_type.is_empty() {
+        call = call.set("Content-Type", &content_type);
+    }
+    if !accept.is_empty() {
+        call = call.set("Accept", &accept);
+    }
+    if !anth_beta.is_empty() {
+        call = call.set("anthropic-beta", &anth_beta);
+    }
+
+    let sent = if method == Method::Get {
+        call.call()
+    } else {
+        call.send_bytes(&body)
+    };
+
+    let resp = match sent {
+        Ok(r) => r,
+        // 上游 4xx/5xx 也是有效响应：状态码与响应体必须原样交给前端，
+        // 否则界面只会看到一句“网络错误”，看不到上游真正说了什么。
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => {
+            send_error(req, 502, &format!("转发到 {UPSTREAM_HOST} 失败: {e}"));
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let mut headers: Vec<Header> = Vec::new();
+    for name in resp.headers_names() {
+        let lower = name.to_ascii_lowercase();
+        // 这三个由 tiny_http 自己管：长度未知时它会用 chunked，
+        // 同时带上去会让客户端解析错乱。
+        if matches!(
+            lower.as_str(),
+            "transfer-encoding" | "connection" | "content-length"
+        ) {
+            continue;
+        }
+        if let Some(v) = resp.header(&name) {
+            if let Ok(h) = Header::from_bytes(name.as_bytes(), v.as_bytes()) {
+                headers.push(h);
+            }
+        }
+    }
+
+    // data_length = None：长度未知，tiny_http 用 chunked 边收边发。
+    // 这就是 SSE 能逐块到达界面的原因。
+    let reader = resp.into_reader();
+    let _ = req.respond(Response::new(
+        StatusCode(status),
+        headers,
+        reader,
+        None,
+        None,
+    ));
 }
 
 /// 最小 percent-decoding：只处理 %XX，够用于会话 id 与文件名。

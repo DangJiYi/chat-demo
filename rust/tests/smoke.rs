@@ -164,7 +164,7 @@ fn status_reports_version_and_dirs() {
     let s = start(true);
     let resp = ureq::get(&s.url("/local/status")).call().expect("status");
     let body: serde_json::Value = resp.into_json().expect("json");
-    assert_eq!(body["version"], "0.2.0");
+    assert_eq!(body["version"], "0.2.1");
     assert_eq!(body["port"], s.port);
     assert!(body["dataDir"].as_str().unwrap().contains("data"));
     assert!(body["platform"].is_string());
@@ -759,4 +759,41 @@ fn balance_without_key_is_not_configured() {
         body.get("error").is_none(),
         "没配 Key 不是错误，不该带 error: {body}"
     );
+}
+
+/// 反向代理的路由契约。
+///
+/// 本地构建下前端把聊天、模型列表、附件上传全部发到同源路径
+/// （`__API_ORIGIN__` 为空），由服务端转发到 api.deepseek.com。
+/// 如果服务端不认这三个前缀，请求会落到静态文件的 404，
+/// 界面报“无法对话”/“API Key 无效”，与真实原因完全无关。
+///
+/// 这里不断言真的转发（那要联网）：只锁住
+/// 「这三个路径被当作代理入口，而不是未知路径」。
+#[test]
+fn proxy_paths_are_routed_not_404() {
+    let s = start(true);
+
+    // 没配 Key 时，代理必须明確告诉调用方“缺 Key”，
+    // 而不是把哨兵值发给上游换一个语焉不详的 401。
+    for path in ["/models", "/anthropic/v1/messages", "/v1/tools"] {
+        let resp = ureq::get(&s.url(path)).call();
+        let code = status(resp);
+        assert_eq!(
+            code, 400,
+            "{path} 应被当作代理入口（没 Key → 400），实际 {code}"
+        );
+    }
+
+    // POST 同样要进代理，不能被“非 GET → 404”吃掉
+    let code = status(
+        ureq::post(&s.url("/anthropic/v1/messages"))
+            .set("Content-Type", "application/json")
+            .send_string(r#"{"messages":[]}"#),
+    );
+    assert_eq!(code, 400, "POST /anthropic/v1/messages 应进代理（400），实际 {code}");
+
+    // 反过来：真的未知路径不能被误当代理（仍走 SPA 回退）
+    let code = status(ureq::get(&s.url("/modelsx")));
+    assert_eq!(code, 200, "/modelsx 不是代理路径，应走 SPA 回退，实际 {code}");
 }

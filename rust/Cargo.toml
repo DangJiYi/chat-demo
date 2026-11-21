@@ -21,7 +21,14 @@ flate2 = "1"
 # default-features=false 是为了排除默认的 rustls（约 +1.5 MB）；
 # native-tls 在 Windows 上用 Schannel、Linux/macOS 用系统 OpenSSL，体积小得多。
 # json 特性提供 into_json()，测试和余额解析都要用。
-ureq = { version = "2", default-features = false, features = ["native-tls", "json"] }
+# proxy-from-env：默认读 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY。
+# Python 版的 urllib 本来就会读这些变量，不开的话同一台机器上
+# “Python 版能查余额、Rust 版报网络错”这种差异会让人找不出原因。
+ureq = { version = "2", default-features = false, features = [
+    "native-tls",
+    "json",
+    "proxy-from-env",
+] }
 
 # 托盘图标：只用系统 API，不引 GUI 框架。
 #

@@ -114,6 +114,9 @@ PUT    /db/staging/session/<id> 暂存会话
 PUT    /db/staging/file/<id>    暂存附件
 POST   /db/staging/filetypes    回填附件 MIME
 POST   /db/staging/commit       暂存 → 正式
+GET    /models                  → 转发 api.deepseek.com/models（校验 Key）
+*      /anthropic/*             → 转发上游（聊天 SSE、附件上传、Files API）
+*      /v1/*                    → 转发上游（语音合成等）
 ```
 
 同步端口（默认 UI 端口 + 1，听 `0.0.0.0`，对局域网开放）：
@@ -128,6 +131,32 @@ GET  /file/<sha256>     按内容取附件原件
 
 **没有鉴权**，所以同步端口只给「读同步数据 + 入队配对请求」；改配置必须由
 本机用户在界面上点接受。这一点和蓝牙配对是同一个道理。
+
+### 反向代理（本地构建的关键一环）
+
+本地构建时 `__API_ORIGIN__` 是空串（见 `rspack.config.ts` 的 `DSH_LOCAL=1`），
+前端**不直连上游**，而是把聊天、附件上传、语音、Key 校验都发到同源路径：
+`/models`、`/anthropic/*`、`/v1/*`。服务端把它们转发到 `api.deepseek.com`，
+并把 Key 注入进去。
+
+少了这一段的表现很容易误判：这些路径在服务端不存在，GET 会落到 SPA 回退
+（返回 index.html，200），POST 则 404 `{"error":"not found"}`。
+于是界面报「无法对话」或「API Key 无效或已被删除」——看起像 Key 的问题，
+实际是根本没有代理。
+
+几个必须保住的细节：
+
+- **流式回传**。聊天走 SSE，先收完整个响应再返回的话，要等回答结束才出字。
+  实现上给 `Response::new` 传 `data_length = None`，tiny_http 用 chunked
+  边收边发。
+- **凭据优先级：浏览器带来的真凭据 > 服务端保存的 Key**。
+  `verifyApiKey()` 只带 `Authorization`、不带 `x-api-key`；哨兵值 `__server__`
+  不算凭据。不这么判的话，验证新 Key 时会被旧 Key 顶替，用户永远换不掉 Key。
+- **上游 4xx/5xx 原样透传**（状态码 + 响应体），不包装成 502。
+  否则界面只能看到“网络错误”，看不到上游说的“Key 无效”。
+- **每个请求一个线程**。代理是流式的，一次回答可能持续几分钟；
+  串行处理会让自动保存、侧边栏状态查询全卡住——表现为「一提问界面就死」。
+- 附件上传按 128 MB 上限读请求体（与会话的 32 MB 分开）。
 
 ### 两条前缀，别弄混
 
