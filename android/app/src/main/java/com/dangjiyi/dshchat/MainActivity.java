@@ -275,8 +275,16 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- 静态资源
 
+    /**
+     * 当前版本的解压目录：www-&lt;stamp&gt;。
+     *
+     * 不要用固定的 "www"：deleteTree 删不掉某些文件时会静默残留，
+     * 每装一次新版就多积一份 3.4 MB，攒几次就变成 17 MB——这正是之前
+     * “界面文件 17.8 MB” 的来源。用版本化目录后，新目录总是干净的，
+     * 旧目录删不掉也影响不到运行。
+     */
     private File wwwDir() {
-        return new File(getFilesDir(), "www");
+        return new File(getFilesDir(), "www-" + appStamp());
     }
 
     private File dataDir() {
@@ -284,15 +292,15 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 把 www/ 从 assets 解压到私有目录。按 versionCode 打戳，升级后自动重解压。
+     * 把 www/ 从 assets 解压到私有目录。目录名带版本戳，
+     * 所以升级后一定是全新目录，并顺手清掉旧版本残留。
      */
     private void extractAssets() throws IOException {
         File target = wwwDir();
-        File stamp = new File(getFilesDir(), "www.stamp");
-        String want = appStamp();
-        String have = stamp.isFile() ? readText(stamp) : "";
-        // index.html 必须存在，否则即便标记对得上也重新解压（防止上次解压半途而废）
-        if (want.equals(have) && new File(target, "index.html").isFile()) {
+        // 目录已完整（上次解压成功）就直接用
+        if (new File(target, "index.html").isFile()) {
+            pruneOldWww(target);
+            ensureDataDir();
             return;
         }
         deleteTree(target);
@@ -300,7 +308,31 @@ public class MainActivity extends Activity {
             throw new IOException("无法创建目录 " + target);
         }
         copyAssetDir("", target);
-        writeText(stamp, want);
+        // 解压完整性自检：缺 index.html 说明中途失败，不能当成功
+        if (!new File(target, "index.html").isFile()) {
+            throw new IOException("解压未完成：" + target + "/index.html 不存在");
+        }
+        pruneOldWww(target);
+        ensureDataDir();
+    }
+
+    /** 删掉 filesDir 下除当前之外的所有 www* 目录（旧版本残留、旧固定名 www、临时目录）。 */
+    private void pruneOldWww(File keep) {
+        File[] kids = getFilesDir().listFiles();
+        if (kids == null) {
+            return;
+        }
+        for (File f : kids) {
+            String n = f.getName();
+            if (!n.startsWith("www") || f.equals(keep)) {
+                continue;
+            }
+            boolean ok = deleteTree(f);
+            Log.i(TAG, "清理旧资源 " + n + " -> " + (ok ? "ok" : "部分失败"));
+        }
+    }
+
+    private void ensureDataDir() {
         if (!dataDir().isDirectory()) {
             // server.py 自己也会建，这里提前建好省得首屏报错
             //noinspection ResultOfMethodCallIgnored
@@ -313,13 +345,22 @@ public class MainActivity extends Activity {
      * 只用 versionCode 的话，重装同一个 versionCode 的包不会重新解压，
      * 修好的 assets 永远进不了设备——这是个很难查的坑。
      */
+    /** 缓存一份：wwwDir() 每次调用都会走这里，不必反复问 PackageManager。 */
+    private volatile String cachedStamp;
+
     private String appStamp() {
+        String s = cachedStamp;
+        if (s != null) {
+            return s;
+        }
         try {
             PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
-            return info.versionCode + "-" + info.lastUpdateTime;
+            s = info.versionCode + "-" + info.lastUpdateTime;
         } catch (Exception e) {
-            return "0";
+            s = "0";
         }
+        cachedStamp = s;
+        return s;
     }
 
     /**
@@ -369,18 +410,18 @@ public class MainActivity extends Activity {
         }
     }
 
-    private static void deleteTree(File f) {
+    private static boolean deleteTree(File f) {
         if (f == null || !f.exists()) {
-            return;
+            return true;
         }
+        boolean ok = true;
         File[] kids = f.listFiles();
         if (kids != null) {
             for (File kid : kids) {
-                deleteTree(kid);
+                ok &= deleteTree(kid);
             }
         }
-        //noinspection ResultOfMethodCallIgnored
-        f.delete();
+        return f.delete() && ok;
     }
 
     private static String readText(File f) throws IOException {
