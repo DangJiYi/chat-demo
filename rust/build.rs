@@ -46,7 +46,10 @@ fn main() {
         // （{Windows 路径的 `\` → `\\`），正好是 include_bytes! 要的形式。
         // 直接在 PathBuf 上 {:?} 依赖 OsStr 的 Debug 实现，不想赌它。
         let abs_s: String = abs.to_string_lossy().into_owned();
-        src.push_str(&format!("    ({rel:?}, include_bytes!({abs_s:?}))),\n"));
+        // 生成一行：    ("index.html", include_bytes!("D:\\...\\www\\index.html")),
+        // 括号数：外层元组一对 + include_bytes 一对，后面跟逗号。
+        src.push_str(&format!(r#"    ({rel:?}, include_bytes!({abs_s:?})),"#));
+        src.push('\n');
     }
     src.push_str("];\n");
 
