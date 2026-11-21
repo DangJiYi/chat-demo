@@ -30,7 +30,7 @@ impl Drop for TestServer {
 
 impl TestServer {
     fn url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{}", self.port, path)
+        format!("http://127.0.0.1:{}{path}", self.port)
     }
 
     /// 数据目录。

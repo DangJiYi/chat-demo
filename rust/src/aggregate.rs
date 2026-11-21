@@ -85,7 +85,7 @@ pub fn list_archived(store: &Store) -> Vec<ArchivedItem> {
         .into_iter()
         .filter(|a| !deleted.contains(&a.id))
         .collect();
-    items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    items.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
     items
 }
 
