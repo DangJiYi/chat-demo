@@ -159,7 +159,7 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
       }
       await saveConfig({ syncPort: value })
       void refresh()
-      return `同步端口已改为 ${value}，重启客户端后生效`
+      return `端口已改为 ${value}，重启客户端后生效`
     })
 
   const accept = (r: PairRequest) =>
@@ -348,7 +348,7 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
               />
             </label>
             <label className={`${styles.field} ${styles.narrow}`}>
-              <span className={styles.label}>同步端口</span>
+              <span className={styles.label}>端口</span>
               <input
                 className={styles.input}
                 inputMode="numeric"
