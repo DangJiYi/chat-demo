@@ -681,3 +681,65 @@ pub fn archive_tick(store: &'static Store) {
     }
     let _ = crate::archive::compact_archive(store);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn lan(ip: &str) -> bool {
+        is_lan_ip(ip.parse::<IpAddr>().expect("ip"))
+    }
+
+    /// 配对闸门：只有局域网来源才允许入队。
+    ///
+    /// 这条 e2e 跑不到（本机只能从回环发），而它直接决定「别人能不能
+    /// 给你的配对队列塞东西」，所以单独钉住。
+    #[test]
+    fn lan_ip_gate() {
+        // 三类私有网段 + 自配地址 + 回环：都应该放行
+        for ip in [
+            "192.168.1.5",
+            "10.0.0.9",
+            "10.255.255.254",
+            "172.16.3.4",
+            "172.31.255.1",
+            "169.254.10.20",
+            "127.0.0.1",
+            "::1",
+        ] {
+            assert!(lan(ip), "应该当作局域网: {ip}");
+        }
+
+        // 公网 / 特殊地址：必须拒绝
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            // 172.32 已经出了 172.16/12 的范围，这是最容易写错边界的那个
+            "172.32.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+        ] {
+            assert!(!lan(ip), "不该当作局域网: {ip}");
+        }
+
+        // 解析不了的字符串一律拒（宁严勿松）
+        assert!(!is_lan_ip_str(""));
+        assert!(!is_lan_ip_str("not-an-ip"));
+        assert!(!is_lan_ip_str("192.168.1.5:8791"));
+    }
+
+    /// peer_url 的规范化：几种写法要落到同一个形状。
+    #[test]
+    fn peer_url_normalizes() {
+        assert_eq!(peer_url("192.168.1.5"), "http://192.168.1.5:8791");
+        assert_eq!(peer_url("192.168.1.5:9000"), "http://192.168.1.5:9000");
+        assert_eq!(peer_url("http://192.168.1.5"), "http://192.168.1.5:8791");
+        assert_eq!(
+            peer_url("http://192.168.1.5:9000/"),
+            "http://192.168.1.5:9000"
+        );
+        assert_eq!(peer_url(""), "");
+        assert_eq!(peer_url("   "), "");
+    }
+}

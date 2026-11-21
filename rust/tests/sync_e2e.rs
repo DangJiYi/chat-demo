@@ -365,6 +365,11 @@ fn sync_pulls_answer_attachment_pairing_and_archive() {
     );
 
     // ---------- 配对：请求只入队，本机接受才生效 ----------
+    //
+    // 注意：队列里的 ip 现在取 **TCP 源地址**，不是请求体里自报的那个。
+    // 这个用例从本机（回环）发出请求，所以期望值就是 127.0.0.1。
+    // 自报的 10.0.0.9 只会被丢掉（并在日志里说明）——这正是要验证的行为：
+    // 多网卡 / VPN 环境下对端自报的地址经常是错的。
     let before = get_json(&a.url("/local/config"));
     let pair_body = serde_json::json!({ "ip": "10.0.0.9", "port": 9999, "name": "手机" });
     ureq::post(&a.sync_url("/peer"))
@@ -378,8 +383,12 @@ fn sync_pulls_answer_attachment_pairing_and_archive() {
         .into_json()
         .expect("json");
     assert_eq!(reqs.len(), 1, "待确认配对应为 1 条: {reqs:?}");
-    assert_eq!(reqs[0]["ip"], "10.0.0.9");
+    assert_eq!(
+        reqs[0]["ip"], "127.0.0.1",
+        "排队里的 ip 应该用实测源地址，而不是自报的 10.0.0.9: {reqs:?}"
+    );
     assert_eq!(reqs[0]["name"], "手机");
+    assert_eq!(reqs[0]["port"], 9999);
 
     let untouched = get_json(&a.url("/local/config"));
     assert_eq!(
@@ -387,12 +396,18 @@ fn sync_pulls_answer_attachment_pairing_and_archive() {
         "收到配对请求就改了配置（应该等本机接受）"
     );
 
+    // 接受时用队列里的地址（也就是实测地址）
+    let accept_ip = reqs[0]["ip"].as_str().expect("ip").to_string();
     ureq::post(&a.url("/local/pair/accept"))
         .timeout(Duration::from_secs(10))
-        .send_json(serde_json::json!({ "ip": "10.0.0.9", "port": 9999 }))
+        .send_json(serde_json::json!({ "ip": accept_ip, "port": 9999 }))
         .expect("pair/accept");
     let after = get_json(&a.url("/local/config"));
-    assert_eq!(after["peer"], "10.0.0.9:9999", "接受配对后配置未生效");
+    assert_eq!(
+        after["peer"],
+        format!("{accept_ip}:9999"),
+        "接受配对后配置未生效"
+    );
     let reqs: Vec<serde_json::Value> = ureq::get(&a.url("/local/pair/requests"))
         .call()
         .expect("pair/requests")
