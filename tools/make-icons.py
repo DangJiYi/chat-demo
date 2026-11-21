@@ -19,6 +19,19 @@ import struct
 import sys
 import zlib
 
+# Windows 上 Python 的 stdout 默认用 cp1252，打中文直接 UnicodeEncodeError。
+# 这里强制 UTF-8；万一 reconfigure 不可用（老版本/特殊环境），退回 replace，
+# 宁可输出乱码也不能让脚本因为一行日志就崩掉。
+def _use_utf8_stdout() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+_use_utf8_stdout()
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "assets", "icon.png")
 ICO_OUT = os.path.join(ROOT, "rust", "assets", "app.ico")
@@ -45,7 +58,7 @@ def read_png(path):
     with open(path, "rb") as f:
         data = f.read()
     if data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise SystemExit("不是 PNG: " + path)
+        raise SystemExit("not a PNG: " + path)
 
     pos = 8
     width = height = None
@@ -61,8 +74,8 @@ def read_png(path):
             )
             if depth != 8 or color != 6 or interlace != 0:
                 raise SystemExit(
-                    "只支持 8 位 RGBA 非隔行 PNG，实际 depth=%d color=%d interlace=%d"
-                    % (depth, color, interlace)
+                    "only 8-bit RGBA non-interlaced PNG is supported; got "
+                    "depth=%d color=%d interlace=%d" % (depth, color, interlace)
                 )
         elif ctype == b"IDAT":
             idat += body
@@ -105,7 +118,7 @@ def read_png(path):
                     pr = c
                 line[i] = (line[i] + pr) & 0xFF
         elif ftype != 0:
-            raise SystemExit("未知 PNG 滤波类型 %d（第 %d 行）" % (ftype, y))
+            raise SystemExit("unknown PNG filter type %d (row %d)" % (ftype, y))
         out[y * stride : (y + 1) * stride] = line
         prev = line
     return width, height, out
@@ -262,23 +275,25 @@ def write_ico(path, src_w, src_h, src_px):
 
 def main():
     if not os.path.isfile(SRC):
-        raise SystemExit("找不到源图: " + SRC)
+        raise SystemExit("source image not found: " + SRC)
 
     w, h, px = read_png(SRC)
-    corner = px[3]
-    transparent = sum(1 for i in range(3, len(px), 4) if px[i] < 255)
-    print("源图 %dx%d，左上角 alpha=%d，非全透明像素 %d / %d"
-          % (w, h, corner, transparent, w * h))
+    # 自检：源图应该是不透明的（带白色圆角底）。如果换了透明背景的图，
+    # 这里会提醒一句——不是错误，只是让人知道托盘图标会是镂空的。
+    opaque = sum(1 for i in range(3, len(px), 4) if px[i] > 0)
+    print("source %dx%d, opaque pixels %d / %d" % (w, h, opaque, w * h))
+    if opaque < w * h // 2:
+        print("note: source is mostly transparent; tray icon will be a cut-out")
 
     size = write_ico(ICO_OUT, w, h, px)
-    print("写入 %s（%d 档，%.1f KB）"
+    print("wrote %s (%d sizes, %.1f KB)"
           % (os.path.relpath(ICO_OUT, ROOT), len(ICO_SIZES), size / 1024))
 
     for folder, side in ANDROID_SIZES.items():
         out = os.path.join(ANDROID_RES, folder, "ic_launcher.png")
         scaled = resize(w, h, px, side, side)
         n = write_png(out, side, side, scaled)
-        print("写入 %-28s %3dpx  %.1f KB"
+        print("wrote %-28s %3dpx  %.1f KB"
               % (os.path.relpath(out, ROOT), side, n / 1024))
     return 0
 

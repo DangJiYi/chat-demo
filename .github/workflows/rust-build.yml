@@ -90,6 +90,10 @@ jobs:
 
       # 图标源图在 assets/icon.png；exe 图标由 build.rs 嵌入。
       - name: Generate icons
+        # 图标是装饰：生成失败不该阻断发布。仓库里已经提交了 app.ico 与 mipmap，
+        # build.rs 用现成的那份；这里失败时会在日志里留下红叉和报错，
+        # 但后面的编译/打包照常跑。
+        continue-on-error: true
         run: python tools/make-icons.py
 
       - uses: Swatinem/rust-cache@v2
@@ -383,6 +387,8 @@ jobs:
 
       # 安卓启动图标（mipmap-*）由这一步生成；gradle 打包时会用到。
       - name: Generate icons
+        # 同 Windows：失败不阻断，仓库里已有生成物兵底。
+        continue-on-error: true
         run: python3 tools/make-icons.py
 
       - uses: Swatinem/rust-cache@v2
