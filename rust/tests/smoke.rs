@@ -11,7 +11,11 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// 每个测试实例的目录号。仅靠时间戳不够（Windows 时钟精度粗），见 try_start。
+static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 一个跑起来的测试实例。Drop 时杀掉进程并清理目录。
 struct TestServer {
@@ -48,8 +52,26 @@ fn free_port() -> u16 {
 
 /// 启动实例。`www` 为 Some 时建一个最小静态站。
 fn start(with_www: bool) -> TestServer {
+    for attempt in 0..3u32 {
+        if let Some(s) = try_start(with_www, attempt) {
+            return s;
+        }
+    }
+    panic!("服务三次都未在 10 秒内就绪");
+}
+
+fn try_start(with_www: bool, attempt: u32) -> Option<TestServer> {
+    // 目录名必须真正唯一。
+    //
+    // 只用 pid + 纳秒是不行的：Windows 上 SystemTime 的精度很粗（历史上
+    // 有 15.6ms 的刻度），而测试是并行跑的，两个测试可能拿到同一个时间戳，
+    // 于是**共用同一个 data 目录**：两个服务器同时写 meta/secret.json，
+    // fs::rename 撞上 Access Denied，PUT /local/apikey 就返回 500。
+    // 这种失败只在并行、只在 Windows 上偶发，看起来像业务 bug。
+    // 加一个进程内原子序号就彻底断了这条路。
+    let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "dsh-rust-test-{}-{}",
+        "dsh-rust-test-{}-{}-{seq}-{attempt}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -83,17 +105,32 @@ fn start(with_www: bool) -> TestServer {
 
     let server = TestServer { child, port, dir };
 
-    // 等就绪：轮询 /local/status，最多 10 秒
+    // 等就绪，并确认这个端口上跑的**确实是本测试刚起的那个进程**。
+    //
+    // free_port 先绑后放，中间有窗口：两个测试可能拿到同一个端口，
+    // 先起的那个占着，后起的那个直接退出（监听失败 → process::exit(1)）。
+    // 这时后一个测试的请求全部会打到前一个测试的服务器上——
+    // 数据目录不同、状态互相污染，报出来的错跟真实原因毫无关系。
+    // 比对 dataDir 就能一眼识破，然后换个端口重来。
+    let want_dir = server.data().display().to_string();
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if let Ok(resp) = ureq::get(&server.url("/local/status")).call() {
             if resp.status() == 200 {
-                return server;
+                if let Ok(st) = resp.into_json::<serde_json::Value>() {
+                    if st["dataDir"].as_str() == Some(want_dir.as_str()) {
+                        return Some(server);
+                    }
+                    eprintln!("端口 {port} 上是别的实例（{}），换个端口重试", st["dataDir"]);
+                    return None; // Drop 会杀掉子进程并清目录
+                }
+                return Some(server);
             }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("服务未在 10 秒内就绪（端口 {port}）");
+    eprintln!("服务未在 10 秒内就绪（端口 {port}）");
+    None // Drop 负责收尾
 }
 
 /// 断言目录里出现某个文件。
@@ -432,13 +469,20 @@ fn apikey_lifecycle_and_hint() {
         "初始不应有 Key"
     );
 
-    // 用一个明显不是真凭据的字符串，只验证格式与存储位置
-    let resp: serde_json::Value = ureq::put(&s.url("/local/apikey"))
+    // 用一个明显不是真凭据的字符串，只验证格式与存储位置。
+    // 不直接 .unwrap()：非 2xx 时 ureq 报的是 Status(500, ...)，
+    // 看不到服务端写了什么原因，排查时等于没有信息。
+    let put = ureq::put(&s.url("/local/apikey"))
         .set("Content-Type", "application/json")
-        .send_string(r#"{"apiKey":"SYNTHETIC-0000"}"#)
-        .unwrap()
-        .into_json()
-        .unwrap();
+        .send_string(r#"{"apiKey":"SYNTHETIC-0000"}"#);
+    let resp: serde_json::Value = match put {
+        Ok(r) => r.into_json().expect("json"),
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            panic!("PUT /local/apikey 返回 {code}：{body}");
+        }
+        Err(e) => panic!("PUT /local/apikey 失败：{e}"),
+    };
     assert!(resp["configured"].as_bool().unwrap_or(false), "存 Key 后应 configured=true");
     assert_eq!(resp["hint"], "…0000", "hint 只露末 4 位");
     assert_file(&s.data(), "meta/secret.json");

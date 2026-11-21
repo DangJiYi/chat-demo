@@ -166,8 +166,41 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+
+    // 失败重试几次：Windows 上 create/rename 会因瞬时占用而失败
+    // （杀毒软件正在扫刚写的文件、索引服务在抓句柄、另一个进程刚打开它）。
+    // 这类失败跟磁盘满、无权限不同，等一下就好了。
+    // 只在真正失败时才返回最后一个错误，不掩盖持久性问题。
+    const ATTEMPTS: u32 = 3;
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        match write_once(path, data) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::other("写入失败")))
+}
+
+fn write_once(path: &Path, data: &[u8]) -> io::Result<()> {
+    // 临时文件名必须**每次不同**。
+    //
+    // 固定为 `<path>.tmp` 时，两个进程写同一份文件会互相踩：
+    //   A 建 tmp 并写入 → B 把同一个 tmp 截断重写 → A 的 rename 拿到 B 的内容，
+    //   或者 B 的 rename 发现 tmp 已被 A 抢走 → 报“找不到文件” → 接口 500。
+    // 这不是虚构场景：同一个 data/ 目录被两个实例共用（双击了两次 exe、
+    // 或者 Rust 版和 Python 版同时跑）就会发生。
+    //
+    // 加 pid + 进程内序号就能让每次写入有自己的 tmp，rename 依然是原子的。
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.{seq}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
     {
         let mut f = fs::File::create(&tmp)?;
@@ -175,7 +208,12 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
         f.sync_all()?;
     }
     // std::fs::rename 在 Windows 上用 MOVEFILE_REPLACE_EXISTING，会覆盖已存在的目标
-    fs::rename(&tmp, path)
+    if let Err(e) = fs::rename(&tmp, path) {
+        // 失败时别把临时文件垃圾留在数据目录里
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 pub struct Store {
