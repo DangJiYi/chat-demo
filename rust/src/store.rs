@@ -87,6 +87,7 @@ impl Store {
     ///   - index.json 是缓存，可能不存在或过期
     ///   - 个人规模几百个文件，扫一遍是毫秒级
     ///   - 少一处「索引与文件不一致」的故障面
+    ///
     /// 单个文件解析失败不影响整体——与 Python 版的容错行为一致。
     pub fn summaries(&self) -> io::Result<Vec<SessionSummary>> {
         let mut out = Vec::new();
