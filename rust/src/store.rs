@@ -197,6 +197,14 @@ pub struct Store {
     sync_bound: std::sync::atomic::AtomicU16,
     /// 同步端口绑定失败的原因（空串表示没问题）。
     sync_bind_err: Mutex<String>,
+    /// 串行化「拉取 + 合并」。
+    ///
+    /// 三个地方会起 pull_once：后台 sync_loop、`POST /local/sync/now`
+    /// （每次点都新起一个线程）、配对接受后。它们会真的同时跑。
+    /// 而合并会话和写 `meta/index.json` 都是**读-改-写**，并发时会丢更新：
+    /// 两个线程各自读到旧 index，各自插自己的那条，后写的把先写的覆盖掉。
+    /// 表现就是“同步过了，但附件/会话少了一条”。
+    pull_lock: Mutex<()>,
 }
 impl Store {
     /// 建好目录结构。已存在则什么也不做（与 Python 版一致）。
@@ -221,6 +229,7 @@ impl Store {
             pair_requests: Mutex::new(Vec::new()),
             sync_bound: std::sync::atomic::AtomicU16::new(0),
             sync_bind_err: Mutex::new(String::new()),
+            pull_lock: Mutex::new(()),
         })
     }
 
@@ -549,6 +558,27 @@ impl Store {
     pub fn set_sync_bind_err(&self, msg: &str) {
         if let Ok(mut g) = self.sync_bind_err.lock() {
             *g = msg.to_string();
+        }
+    }
+
+    /// 拿拉取锁：保证「读对端 → 合并 → 写索引」这一整套不被打断。
+    ///
+    /// 锁中毒时照样放行（用 into_inner）：中毒说明上个持锁线程 panic 了，
+    /// 但数据本身是文件，不会因此不一致；这里宁可能拉一次，也不要让
+    /// 同步线程全部停掉——那就变成“彻底不同步”了。
+    pub fn lock_pull(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.pull_lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 不等待地试拿拉取锁；None 表示已有一轮在跑。
+    ///
+    /// 后台循环用这个：对端离线时每次拉取会卡到网络超时（几十秒），
+    /// 阻塞式拿锁会让循环每 3 秒叠一个线程上去，越堆越多。
+    pub fn try_lock_pull(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        match self.pull_lock.try_lock() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
         }
     }
 

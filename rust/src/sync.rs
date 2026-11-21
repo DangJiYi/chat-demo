@@ -472,7 +472,24 @@ pub fn discovery_server(store: &'static Store) {
 // ------------------------------------------------------------------ 拉取
 
 /// 拉一次对端数据。失败只记录在状态里，不抛错（同步是尽力而为）。
+///
+/// 拿不到锁时会等（手动点「立即同步」就应该真的跑一趟）。
 pub fn pull_once(store: &Store) {
+    let _guard = store.lock_pull();
+    pull_locked(store);
+}
+
+/// 后台循环用：已有一轮在跑就跳过本轮，不叠线程。返回是否真的跑了一轮。
+pub fn try_pull_once(store: &Store) -> bool {
+    let Some(_guard) = store.try_lock_pull() else {
+        return false;
+    };
+    pull_locked(store);
+    true
+}
+
+/// 真正干活的拉取。调用方必须已持拉取锁。
+fn pull_locked(store: &Store) {
     let cfg = store.config();
     let peer = cfg
         .get("peer")
@@ -551,7 +568,17 @@ pub fn pull_once(store: &Store) {
                 }
             };
             if let Some(buf) = bytes {
-                let _ = store.put_file(&meta.id, &buf, &meta.mime, &meta.name, meta.is_image);
+                // 网络拉取失败不记日志：下一轮会重试，而且对端离线时
+                // 每 3 秒写一行会把 app.log 刷满。
+                // 但**本地写入失败**是真问题（磁盘满、权限、路径异常），
+                // 不会自愈，必须留痕。
+                if let Err(e) = store.put_file(&meta.id, &buf, &meta.mime, &meta.name, meta.is_image)
+                {
+                    crate::applog::write(
+                        store,
+                        &format!("附件 {} 写入失败: {e}", meta.id),
+                    );
+                }
             }
         }
     }
@@ -598,7 +625,9 @@ pub fn sync_loop(store: &'static Store) {
         if peer.is_empty() {
             std::thread::sleep(Duration::from_secs(2));
         } else {
-            pull_once(store);
+            // try_ 而不是阻塞：本轮已有拉取在跑（手动点、或上一轮卡在超时）
+            // 就跳过，下一轮再来。
+            try_pull_once(store);
             std::thread::sleep(Duration::from_secs(interval));
         }
     }
@@ -609,6 +638,11 @@ pub fn sync_loop(store: &'static Store) {
 /// 启动后延迟整理：归档 + 去重（无损），不做任何删除性动作。
 pub fn archive_tick(store: &'static Store) {
     std::thread::sleep(Duration::from_secs(30));
+    // 与同步共用一把锁：归档写 index.json 的 archive 键，
+    // 同步写同一个文件的 files 键，而两边都是「读整个文件 → 改一个键 → 写回」。
+    // 不串行的话，后写的会把先写的那个键整片抹掉——
+    // 表现是「附件全部 404」或「归档列表空了」，而且只在并发时偶发。
+    let _guard = store.lock_pull();
     match crate::archive::archive_once(store) {
         Ok(0) => {}
         Ok(n) => {

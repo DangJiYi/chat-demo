@@ -899,6 +899,8 @@ pub fn handle(mut req: Request, st: &'static Store, www: &Path, version: &str) {
 
     // ---------- /local/archive/now ----------
     if path == "/local/archive/now" && method == Method::Post {
+        // 与同步共用一把锁：两边都改 meta/index.json（一个写 archive，一个写 files）
+        let _guard = st.lock_pull();
         // 用户点「立即整理」才去重：显式动作，不在后台自动删东西
         let (dropped, freed) = crate::archive::compact_archive(st).unwrap_or((0, 0));
         match crate::archive::archive_once(st) {
@@ -1154,6 +1156,9 @@ pub fn handle_sync(mut req: Request, st: &'static Store, version: &str) {
             serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
         let mut accepted = 0i64;
         if let Some(arr) = payload.get("sessions").and_then(|v| v.as_array()) {
+            // 与 pull_once 共用一把锁：两边都在改会话文件，
+            // 不串行就会出现「刚合并完的又被对方写回去」。
+            let _guard = st.lock_pull();
             for doc in arr {
                 if let Ok(true) = crate::sync::merge_remote(st, doc) {
                     accepted += 1;

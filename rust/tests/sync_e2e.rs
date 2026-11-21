@@ -189,6 +189,28 @@ fn get_json(url: &str) -> serde_json::Value {
         .expect("json")
 }
 
+/// 轮询直到某个附件能按 id 读回。
+///
+/// 不能“等到了会话就以为附件也到了”：`/local/sync/now` 是异步的
+/// （`thread::spawn`），而 `pull_once` 里**先合并会话、后下载附件**。
+/// 会话落盘是本地写，附件要额外跑一趟 HTTP，两者之间有真实时间差。
+/// 直接断言就是赌那个差值足够小——CI 一慢就红。
+fn wait_file(url: &str, want: &[u8]) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if let Ok(resp) = ureq::get(url).timeout(Duration::from_secs(2)).call() {
+            if resp.status() == 200 {
+                let mut body = Vec::new();
+                if resp.into_reader().read_to_end(&mut body).is_ok() && body == want {
+                    return Some(body);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
 /// 轮询直到 /db/session/<id> 能读到，返回文档。
 fn wait_session(url: &str) -> Option<serde_json::Value> {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -302,13 +324,8 @@ fn sync_pulls_answer_attachment_pairing_and_archive() {
     );
 
     // ---------- 附件：落盘 + 登记进索引 ----------
-    let got = ureq::get(&a.url("/db/file/pf1"))
-        .timeout(Duration::from_secs(10))
-        .call()
-        .expect("附件应能按 id 读回");
-    let mut body = Vec::new();
-    got.into_reader().read_to_end(&mut body).expect("读附件");
-    assert_eq!(body.as_slice(), payload.as_slice(), "同步过来的附件内容不对");
+    // 等它真的到（会话先到不代表附件也到了），再断言内容。
+    wait_file(&a.url("/db/file/pf1"), payload).expect("同步过来的附件读不回来");
     assert!(
         a.data().join("media").join(&sha).is_file(),
         "附件原件未按 sha 落盘"
