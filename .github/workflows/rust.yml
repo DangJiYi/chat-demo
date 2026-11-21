@@ -90,8 +90,9 @@ jobs:
             if ($s[0].updatedAt -ne 3000) { throw "updatedAt 字段名/值不对（应为 camelCase 的 3000），实际 $($s[0].updatedAt)" }
             if ($s[0].createdAt -ne 1000) { throw "createdAt 字段名/值不对（应为 camelCase 的 1000），实际 $($s[0].createdAt)" }
 
-            $code = (Invoke-WebRequest -Uri "http://127.0.0.1:8799/nope" -SkipHttpErrorCheck).StatusCode
-            if ($code -ne 404) { throw "未知路径应返回 404，实际 $code" }
+            # 带扩展名却找不到 → 404（不能兜底成 index.html）
+            $code = (Invoke-WebRequest -Uri "http://127.0.0.1:8799/nope.js" -SkipHttpErrorCheck).StatusCode
+            if ($code -ne 404) { throw "带扩展名的未知路径应返回 404，实际 $code" }
 
             # ---------- 静态文件 ----------
             $idx = Invoke-WebRequest -Uri "http://127.0.0.1:8799/" -TimeoutSec 5
@@ -107,8 +108,10 @@ jobs:
             $fb = Invoke-WebRequest -Uri "http://127.0.0.1:8799/some/route" -TimeoutSec 5
             if ($fb.Content -notmatch '<div id=root>') { throw "未知无扩展名路径应回退到 index.html" }
 
-            # 目录穿越必须被拒绝
-            $trav = Invoke-WebRequest -Uri "http://127.0.0.1:8799/../build.gradle" -SkipHttpErrorCheck -TimeoutSec 5
+            # 目录穿越必须被拒绝。
+            # 用 %2e%2e%2f 而不是字面的 ../，否则 .NET 的 Uri 会先规范化，
+            # 请求根本到不了服务端，这条断言就形同虚设。
+            $trav = Invoke-WebRequest -Uri "http://127.0.0.1:8799/%2e%2e%2fbuild.gradle" -SkipHttpErrorCheck -TimeoutSec 5
             if ($trav.StatusCode -eq 200) { throw "目录穿越未被拦下" }
 
             # ---------- 会话读写 ----------
