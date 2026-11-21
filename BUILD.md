@@ -191,23 +191,32 @@ keytool -genkeypair -keystore release.keystore -alias dsh -keyalg RSA -keysize 2
 一次性配置，之后每次出包都是精简版。**注意：从 debug 签名换到自己的签名，
 手机上必须先卸载旧版再装**（签名不同不能覆盖安装）。
 
-### 解压的前端资源（旧版本会残留）
+### 解压的前端资源
 
 安卓读不了 APK 内的 `assets`，所以首次启动会把前端解压到应用私有目录，
 再把它作为 `--www` 传给 `server.py`。
 
-早期版本用的是固定目录名 `www` + `www.stamp` 标记，靠 `deleteTree` 删旧文件。
-但 `deleteTree` 的返回值被忽略：只要有一个文件删不掉（被占用、权限），
-**旧副本就静默残留**，而新副本又拷进去。装几次新版就积出几份 3.4 MB 的副本。
-实测症状：面板显示“界面文件 17.8 MB”，而 APK 里 `assets/static` 只有 3.44 MB。
+**只拷白名单里的条目**（`index.html`、`LICENSE`、`static`）。
 
-现在目录名带版本戳（`www-<versionCode>-<lastUpdateTime>`）：
+这不是多余的防御。Android 会把 **WebView 提供者的 assets 合并进
+`AssetManager.list("")` 的顶层命名空间**，所以直接遍历资产根会拷到：
 
-- 升级后目录名必然变，新目录总是干净的
-- `pruneOldWww()` 启动时删掉 `filesDir` 下除当前之外的所有 `www*`
-- 解压后检查 `index.html` 是否存在，缺了就不当成功
+```text
+icudtl.dat+com.google.android.webview+    8.81 MB
+telocation.idf                            3.26 MB
+stored-locales                            1.32 MB
+resources.pak+com.google.android.webview+ 0.41 MB
+v8_context_snapshot_64.bin+...            0.20 MB
+images                                    0.12 MB
+```
 
-所以升级一次之后，历史残留会被自动清掉，占用稳定在 3.4 MB。
+这些是 WebView 自己的运行时资源，WebView 从它自己的 APK 里读，
+拷到应用目录纯粹是白占空间——界面文件从 3.44 MB 虚增到 17.8 MB（453 个文件）。
+
+目录名带版本戳（`www-<versionCode>-<lastUpdateTime>`），升级后必然换新目录，
+`pruneOldWww()` 顺带删掉旧的 `www*`（包括曾经被污染的那份）。
+解压完会检查 `index.html` 存在、并统计文件数（正常约 60），
+日志里能看到 `前端解压完成：N 个文件`。
 
 ### 几个已知点
 

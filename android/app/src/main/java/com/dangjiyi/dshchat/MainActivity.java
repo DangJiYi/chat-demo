@@ -312,8 +312,28 @@ public class MainActivity extends Activity {
         if (!new File(target, "index.html").isFile()) {
             throw new IOException("解压未完成：" + target + "/index.html 不存在");
         }
+        // 自检：期望约 60 个文件（111 个资产中的 static 子树）。
+        // 明显偏大说明白名单失效，又把 WebView 的资产拷进来了。
+        int files = countFiles(target);
+        Log.i(TAG, "前端解压完成：" + files + " 个文件 -> " + target);
+        if (files > 200) {
+            Log.w(TAG, "文件数异常偏大（" + files + "），白名单可能失效");
+        }
         pruneOldWww(target);
         ensureDataDir();
+    }
+
+    /** 统计目录下的文件数，用于自检。 */
+    private static int countFiles(File dir) {
+        int n = 0;
+        File[] kids = dir.listFiles();
+        if (kids == null) {
+            return 0;
+        }
+        for (File f : kids) {
+            n += f.isDirectory() ? countFiles(f) : 1;
+        }
+        return n;
     }
 
     /** 删掉 filesDir 下除当前之外的所有 www* 目录（旧版本残留、旧固定名 www、临时目录）。 */
@@ -364,11 +384,29 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 递归复制 assets。AssetManager 对「空目录」和「文件」都返回空数组，本项目没有空目录，
-     * 所以用「list 非空即目录」判断足够。
+     * 我们自己的前端资源顶层条目。**只拷这些。**
      *
-     * 注意：Chaquopy 会把自己的运行时放在 assets/chaquopy/（app.zip + stdlib），
-     * 这些不能当成前端资源抄进 www/，否则白拷几十 MB。
+     * 为什么必须用白名单：Android 会把 WebView 提供者的 assets 合并进
+     * AssetManager.list("") 的顶层命名空间。实际看到的条目：
+     *   icudtl.dat+com.google.android.webview+   8.81 MB
+     *   telocation.idf                             3.26 MB
+     *   stored-locales                             1.32 MB
+     *   resources.pak+com.google.android.webview+  0.41 MB
+     *   v8_context_snapshot_64.bin+...             0.20 MB
+     *   images                                     0.12 MB
+     * 这些不是我们的东西，却被拷进了应用私有目录：
+     * 界面文件从 3.44 MB 虚增到 17.8 MB，453 个文件。
+     *
+     * Chaquopy 的 assets/chaquopy 同理，也不能拷（那是 Python 运行时）。
+     */
+    private static final java.util.Set<String> OWN_ASSETS =
+            new java.util.HashSet<>(java.util.Arrays.asList("index.html", "LICENSE", "static"));
+
+    /**
+     * 递归复制 assets/static 下的内容。
+     *
+     * AssetManager 对「空目录」和「文件」都返回空数组，本项目没有空目录，
+     * 所以用「list 非空即目录」判断足够。
      */
     private void copyAssetDir(String path, File outDir) throws IOException {
         AssetManager am = getAssets();
@@ -377,7 +415,8 @@ public class MainActivity extends Activity {
             return;
         }
         for (String name : children) {
-            if (path.isEmpty() && "chaquopy".equals(name)) {
+            // 只拷顶层白名单里的条目，避开 WebView 与 Chaquopy 的资产
+            if (path.isEmpty() && !OWN_ASSETS.contains(name)) {
                 continue;
             }
             String childPath = path.isEmpty() ? name : path + "/" + name;
