@@ -24,10 +24,40 @@ struct Args {
     www: String,
 }
 
+/// 找一个默认目录：先看 exe 同级，再向上逐级找，都不存在就用 exe 同级。
+///
+/// 为什么向上找：开发时 exe 在 `rust/target/release/`，而 `www` 与 `data`
+/// 在仓库根或 `chat/` 下。没有这一步，本地跑就得每次手写 `--www ../www`。
+fn resolve_default(exe_dir: &std::path::Path, name: &str) -> String {
+    // 向上最多找 5 级（target/release → target → rust → chat → 仓库根）
+    let mut probe = Some(exe_dir);
+    for _ in 0..5 {
+        let Some(dir) = probe else { break };
+        let candidate = dir.join(name);
+        if candidate.is_dir() {
+            return candidate.display().to_string();
+        }
+        probe = dir.parent();
+    }
+    exe_dir.join(name).display().to_string()
+}
+
 fn parse_args() -> Args {
     let mut port: u16 = 8790;
-    let mut data = String::from("data");
-    let mut www = String::from("www");
+
+    // 默认路径跟 Python 版一致：相对 **exe 所在目录**，不是当前工作目录。
+    //
+    // 否则双击 exe（CWD 可能是 System32 或任意目录）就找不到 www，
+    // 界面上表现为 404，而日志里只有一句“index.html 缺失”。
+    // 开发时从仓库根跑也可以，那时 exe 在 rust/target/release/，
+    // 下面会在找不到时逐级向上找（见 resolve_default）。
+    let exe_dir = env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    let mut data = resolve_default(&exe_dir, "data");
+    let mut www = resolve_default(&exe_dir, "www");
 
     // 收成 Vec 再用下标遍历：避免 `while let Some(x) = it.next()` 在循环里
     // 又调用 it.next() 时被 clippy 判为 while_let_on_iterator。
@@ -103,7 +133,10 @@ fn main() {
     if www_ok {
         println!("静态目录 {www_dir} (index.html 存在)");
     } else {
+        // 说清怎么办：光报“缺失”，用户不知道是参数没给还是目录不对
         println!("静态目录 {www_dir} (index.html 缺失，界面会 404)");
+        println!("  用 --www 指向含 index.html 的目录，例如：");
+        println!("    dsh-chat --www ./www");
     }
 
     for request in server.incoming_requests() {

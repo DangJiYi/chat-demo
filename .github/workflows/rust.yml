@@ -152,6 +152,27 @@ jobs:
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           }
 
+          # 不传 --www 时应该相对 exe 所在目录向上找，而不能依赖 CWD。
+          $layout = Join-Path $env:RUNNER_TEMP 'layout'
+          $bin = Join-Path $layout 'rust\target\release'
+          New-Item -ItemType Directory -Force -Path $bin, (Join-Path $layout 'www') | Out-Null
+          Set-Content -Encoding utf8 (Join-Path $layout 'www\index.html') '<div id=root>x</div>'
+          Copy-Item $exe (Join-Path $bin 'dsh-chat.exe')
+          Push-Location $env:RUNNER_TEMP
+          $p2 = Start-Process -FilePath (Join-Path $bin 'dsh-chat.exe') -ArgumentList '--port','8798' -PassThru -NoNewWindow -RedirectStandardOutput 'out2.txt'
+          try {
+            $ok2 = $false
+            for ($i = 0; $i -lt 40; $i++) {
+              Start-Sleep -Milliseconds 250
+              try { if ((Invoke-WebRequest 'http://127.0.0.1:8798/' -TimeoutSec 2).StatusCode -eq 200) { $ok2 = $true; break } } catch { }
+            }
+            if (-not $ok2) { Get-Content 'out2.txt' -ErrorAction SilentlyContinue; throw '不传 --www 时未能从 exe 目录向上找到 www' }
+            Write-Host '默认路径解析 OK'
+          } finally {
+            Stop-Process -Id $p2.Id -Force -ErrorAction SilentlyContinue
+            Pop-Location
+          }
+
       - uses: actions/upload-artifact@v5
         with:
           name: dsh-chat-rust-windows

@@ -115,7 +115,20 @@ DELETE /db/session/<id>     删会话（写墓碑，不删文件）
 本地想自己跑的话，先装 VS Build Tools（勾 MSVC v143 + Windows SDK），再：
 
 ```bash
-cd rust && cargo run -- --port 8790 --data ../data
+cd rust && cargo run -- --port 8790
+```
+
+**默认路径不依赖当前目录。** `www` 与 `data` 默认相对 **exe 所在目录**，
+并会向上逐级找（最多 5 层）。所以从 `rust/target/release/` 跑 exe 时，
+能在 `chat/www` 找到前端；双击 exe 也不会因为 CWD 是 System32 就 404。
+
+这一步是必需的，不是娇情：之前默认值用 CWD 相对路径，结果双击就报
+「index.html 缺失，界面会 404」。
+
+需要指定其他目录时：
+
+```bash
+dsh-chat --port 8790 --data <数据目录> --www <前端目录>
 ```
 
 ### 设计约束
