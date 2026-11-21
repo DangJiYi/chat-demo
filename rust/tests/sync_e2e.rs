@@ -19,6 +19,11 @@ use sha2::{Digest, Sha256};
 struct Node {
     child: Child,
     port: u16,
+    /// **实际在监听**的同步端口，从 `/local/status` 读，不是 `port + 1`。
+    ///
+    /// 之前这里硬算 `port + 1`，结果端口绑不上时测试报的是“连接被拒”，
+    /// 完全看不出是服务端根本没监听——诊断成本极高。
+    sync_port: u16,
     dir: PathBuf,
 }
 
@@ -35,9 +40,9 @@ impl Node {
         format!("http://127.0.0.1:{}{path}", self.port)
     }
 
-    /// 同步端口：默认是 UI 端口 + 1。
+    /// 同步端口：用服务端实际监听的那个。
     fn sync_url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{path}", self.port + 1)
+        format!("http://127.0.0.1:{}{path}", self.sync_port)
     }
 
     fn data(&self) -> PathBuf {
@@ -93,6 +98,12 @@ fn try_start(tag: &str, attempt: u32) -> Option<Node> {
         .expect("write index");
 
     let port = free_port_pair();
+    // 子进程的输出落到文件里：出问题时能直接看到它为什么没起来。
+    // （之前用 Stdio::null()，绑定失败那句 eprintln! 被吞了，
+    //   只能看到“连接被拒”，白跑一轮 CI。）
+    let log_path = dir.join("out.log");
+    let out = std::fs::File::create(&log_path).expect("create log");
+    let err = out.try_clone().expect("clone log");
     let child = Command::new(env!("CARGO_BIN_EXE_dsh-chat"))
         .arg("--port")
         .arg(port.to_string())
@@ -100,22 +111,56 @@ fn try_start(tag: &str, attempt: u32) -> Option<Node> {
         .arg(dir.join("data"))
         .arg("--www")
         .arg(dir.join("www"))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(out))
+        .stderr(std::process::Stdio::from(err))
         .spawn()
         .expect("spawn dsh-chat");
 
-    let mut node = Node { child, port, dir };
+    // UI 先就绪
+    let mut node = Node {
+        child,
+        port,
+        sync_port: 0,
+        dir,
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ready = false;
     while Instant::now() < deadline {
         if let Ok(resp) = ureq::get(&node.url("/local/status")).call() {
             if resp.status() == 200 {
-                return Some(node);
+                ready = true;
+                break;
             }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    // 没起来：Drop 会杀进程、删目录
+
+    // 再等同步端口真的开始监听。
+    // 服务端在主线程里同步完成绑定才进 UI 循环，所以这一步基本是瞬间的；
+    // 留着重试是为了不把一个已知的时序差异变成 flake。
+    if ready {
+        let sync_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < sync_deadline {
+            if let Ok(resp) = ureq::get(&node.url("/local/status")).call() {
+                if let Ok(st) = resp.into_json::<serde_json::Value>() {
+                    if st["syncListening"].as_bool().unwrap_or(false) {
+                        if let Some(p) = st["syncPort"].as_u64() {
+                            node.sync_port = p as u16;
+                            return Some(node);
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let detail = std::fs::read_to_string(&log_path).unwrap_or_default();
+        eprintln!("─ 同步端口未监听，子进程输出：\n{detail}");
+    } else {
+        let detail = std::fs::read_to_string(&log_path).unwrap_or_default();
+        eprintln!("─ 服务未就绪，子进程输出：\n{detail}");
+    }
+
+    // 没起来：清干净再重试
     let _ = node.child.kill();
     let _ = node.child.wait();
     let _ = std::fs::remove_dir_all(&node.dir);
@@ -234,7 +279,7 @@ fn sync_pulls_answer_attachment_pairing_and_archive() {
     assert!(since["now"].as_i64().unwrap_or(0) > 0, "缺少游标 now");
 
     // ---------- A 指向 B 并拉一次 ----------
-    let patch = serde_json::json!({ "peer": format!("127.0.0.1:{}", b.port + 1) });
+    let patch = serde_json::json!({ "peer": format!("127.0.0.1:{}", b.sync_port) });
     ureq::put(&a.url("/local/config"))
         .timeout(Duration::from_secs(5))
         .send_json(patch)

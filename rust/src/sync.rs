@@ -388,10 +388,7 @@ pub fn discover_peers(store: &Store, timeout: Duration) -> Vec<DiscoveredPeer> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let sync_port = cfg
-        .get("syncPort")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(8791);
+    let sync_port = store.sync_port_advertised();
     let payload = format!(
         "{} {}",
         String::from_utf8_lossy(DISCOVER_MAGIC),
@@ -462,10 +459,7 @@ pub fn discovery_server(store: &'static Store) {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let sync_port = cfg
-            .get("syncPort")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(8791);
+        let sync_port = store.sync_port_advertised();
         let reply = format!(
             "{} {}",
             String::from_utf8_lossy(DISCOVER_REPLY),

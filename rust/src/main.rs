@@ -38,6 +38,8 @@ struct Args {
     www: String,
     /// 不隐藏控制台（调试/自查用）
     console: bool,
+    /// 显式指定同步端口（优先于 config.json）
+    sync_port: Option<u16>,
 }
 
 /// 找一个默认目录：exe 同级优先，其次向上逐级找（最多 5 层）。
@@ -73,6 +75,7 @@ fn parse_args() -> Args {
     let mut data = resolve_default(&exe_dir, "data", false);
     let mut www = resolve_default(&exe_dir, "www", true);
     let mut console = false;
+    let mut sync_port: Option<u16> = None;
 
     // 收成 Vec 再用下标遍历：避免 `while let Some(x) = it.next()` 在循环里
     // 又调用 it.next() 时被 clippy 判为 while_let_on_iterator。
@@ -100,8 +103,13 @@ fn parse_args() -> Args {
                     www = v.clone();
                 }
             }
-            // 同步端口由 config.json 里的 syncPort 决定，这里只兼容性吞掉参数
-            "--sync-port" => takes_value = true,
+            // 同步端口：默认取 config.json 里的 syncPort（UI 端口 + 1）
+            "--sync-port" => {
+                takes_value = true;
+                if let Some(v) = argv.get(i + 1) {
+                    sync_port = v.parse().ok();
+                }
+            }
             "--console" => console = true,
             "--no-window" => {}
             "-h" | "--help" => {
@@ -118,7 +126,28 @@ fn parse_args() -> Args {
         data,
         www,
         console,
+        sync_port,
     }
+}
+
+/// 绑同步端口：先试配置值，失败就往下试几个。
+///
+/// 为什么不能只试一次：8791 是热门端口，本机同时跑两个实例、或者 Windows
+/// 把这段划进 Hyper-V 的保留区间（`netsh int ipv4 show excludedportrange`），
+/// 都会直接绑不上。以前只在日志里记一行就接着跑，结果界面照样显示 8791、
+/// 对端连过来却“拒绝连接”——用户看到的是一句完全无从下手的报错。
+fn bind_sync(want: u16) -> Result<(u16, Server), String> {
+    let mut last = String::from("没有可用端口");
+    for offset in 0..5u16 {
+        let Some(port) = want.checked_add(offset) else {
+            break;
+        };
+        match Server::http(format!("0.0.0.0:{port}")) {
+            Ok(s) => return Ok((port, s)),
+            Err(e) => last = format!("{port}: {e}"),
+        }
+    }
+    Err(last)
 }
 
 fn main() {
@@ -149,25 +178,43 @@ fn main() {
 
     // 同步端口：默认 UI 端口 + 1，可在界面上改（存在 config.json）
     let cfg = store.config();
-    let sync_port = cfg
-        .get("syncPort")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(args.port as i64 + 1)
-        .clamp(1024, 65535) as u16;
+    let want_sync = args.sync_port.unwrap_or_else(|| {
+        cfg.get("syncPort")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(args.port as i64 + 1)
+            .clamp(1024, 65535) as u16
+    });
 
-    match Server::http(format!("0.0.0.0:{sync_port}")) {
-        Ok(s) => {
+    let sync_port = match bind_sync(want_sync) {
+        Ok((port, s)) => {
+            store.set_sync_bound(port);
+            if port != want_sync {
+                // 配置里的端口用不了，把实际用的写回去。
+                // 不写的话，界面、UDP 发现广播出去的都是一个没人监听的端口，
+                // 对端永远连不上，而本机看不出任何异常。
+                let patch = serde_json::json!({ "syncPort": port })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                let _ = store.save_config(&patch);
+                let msg = format!("同步端口 {want_sync} 不可用，已改用 {port}");
+                applog::write(store, &msg);
+                println!("{msg}");
+            }
             thread::spawn(move || {
                 for request in s.incoming_requests() {
                     http::handle_sync(request, store, VERSION);
                 }
             });
+            port
         }
         Err(e) => {
-            applog::write(store, &format!("同步端口 {sync_port} 不可用: {e}"));
-            eprintln!("同步端口 {sync_port} 不可用: {e}");
+            store.set_sync_bind_err(&e);
+            applog::write(store, &format!("同步端口绑定失败: {e}"));
+            eprintln!("同步端口绑定失败: {e}");
+            0
         }
-    }
+    };
 
     thread::spawn(move || sync::sync_loop(store));
     thread::spawn(move || sync::discovery_server(store));
@@ -176,7 +223,11 @@ fn main() {
     println!("dsh-chat {VERSION} 就绪 http://{addr}/");
     let data_dir = store.dir().display();
     println!("数据目录 {data_dir}");
-    println!("同步端口 0.0.0.0:{sync_port}");
+    if sync_port == 0 {
+        println!("同步端口 未监听（绑定失败，详见 data/app.log）");
+    } else {
+        println!("同步端口 0.0.0.0:{sync_port}");
+    }
     applog::write(
         store,
         &format!(

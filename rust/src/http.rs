@@ -212,6 +212,13 @@ pub fn handle(mut req: Request, st: &'static Store, www: &Path, version: &str) {
             port: u16,
             #[serde(rename = "syncPort")]
             sync_port: u16,
+            /// 同步端口是否真的在监听。
+            /// 界面拿它判断“本端地址”能不能对外宣称。
+            #[serde(rename = "syncListening")]
+            sync_listening: bool,
+            /// 绑定失败的原因（没失败就是空串）。
+            #[serde(rename = "syncErr")]
+            sync_err: String,
             #[serde(rename = "uptimeSec")]
             uptime_secs: u64,
             platform: String,
@@ -222,11 +229,18 @@ pub fn handle(mut req: Request, st: &'static Store, www: &Path, version: &str) {
             device_name: String,
         }
         let cfg = st.config();
-        let sync_port = cfg
-            .get("syncPort")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(st.port() as i64 + 1)
-            .clamp(1024, 65535) as u16;
+        // 报**实际**在监听的端口，而不是配置值。
+        // 配置值只是“想要哪个”，端口被占时会退到别的端口；
+        // 用配置值的话，界面会要用户把这个连不上的端口告诉对端。
+        let bound = st.sync_bound();
+        let sync_port = if bound != 0 {
+            bound
+        } else {
+            cfg.get("syncPort")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(st.port() as i64 + 1)
+                .clamp(1024, 65535) as u16
+        };
         let device_name = cfg
             .get("deviceName")
             .and_then(|v| v.as_str())
@@ -240,6 +254,8 @@ pub fn handle(mut req: Request, st: &'static Store, www: &Path, version: &str) {
                 data_dir: st.dir().display().to_string(),
                 port: st.port(),
                 sync_port,
+                sync_listening: bound != 0,
+                sync_err: st.sync_bind_err(),
                 uptime_secs: st.uptime_secs(),
                 platform: std::env::consts::OS.to_string(),
                 local_ips: crate::sync::local_ips(),
@@ -743,10 +759,7 @@ pub fn handle(mut req: Request, st: &'static Store, www: &Path, version: &str) {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let port = cfg
-            .get("syncPort")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(st.port() as i64 + 1);
+        let port = st.sync_port_advertised();
         send_json(
             req,
             200,
@@ -797,11 +810,7 @@ pub fn handle(mut req: Request, st: &'static Store, www: &Path, version: &str) {
         // 反向：请对端也指向本机。对端只会入待确认队列，不直接生效。
         let mut reverse = "skipped".to_string();
         if let Some(mine) = crate::sync::local_ips().into_iter().next() {
-            let my_port = st
-                .config()
-                .get("syncPort")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(st.port() as i64 + 1);
+            let my_port = st.sync_port_advertised();
             let my_name = st
                 .config()
                 .get("deviceName")

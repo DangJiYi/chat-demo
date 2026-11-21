@@ -189,6 +189,14 @@ pub struct Store {
     sync: Mutex<SyncState>,
     /// 待本机确认的配对请求。
     pair_requests: Mutex<Vec<PairRequest>>,
+    /// **实际**在监听的同步端口；0 表示没绑上。
+    ///
+    /// 与 config.json 里的 syncPort 分开存：配置值只是「想要哪个」，
+    /// 端口被占时实际会退到别的端口。界面要告诉对端该连哪里，
+    /// 只能用实际值——用配置值就会造成“界面显示 8791、对端连不上”。
+    sync_bound: std::sync::atomic::AtomicU16,
+    /// 同步端口绑定失败的原因（空串表示没问题）。
+    sync_bind_err: Mutex<String>,
 }
 impl Store {
     /// 建好目录结构。已存在则什么也不做（与 Python 版一致）。
@@ -211,6 +219,8 @@ impl Store {
             balance_cache: Mutex::new((0, None)),
             sync: Mutex::new(SyncState::default()),
             pair_requests: Mutex::new(Vec::new()),
+            sync_bound: std::sync::atomic::AtomicU16::new(0),
+            sync_bind_err: Mutex::new(String::new()),
         })
     }
 
@@ -517,6 +527,44 @@ impl Store {
         if let Ok(mut g) = self.pair_requests.lock() {
             g.retain(|r| !(r.ip == ip && r.port == port));
         }
+    }
+
+    /// 实际在监听的同步端口，0 表示没绑上。
+    pub fn sync_bound(&self) -> u16 {
+        self.sync_bound.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_sync_bound(&self, port: u16) {
+        self.sync_bound
+            .store(port, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn sync_bind_err(&self) -> String {
+        self.sync_bind_err
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_sync_bind_err(&self, msg: &str) {
+        if let Ok(mut g) = self.sync_bind_err.lock() {
+            *g = msg.to_string();
+        }
+    }
+
+    /// 对外宣称的同步端口：**优先实际监听值**，退到配置值。
+    ///
+    /// UDP 发现广播、`/local/discover` 的 `self.port` 都用它。
+    /// 广播一个没人监听的端口，就等于让对端去连一个不存在的服务。
+    pub fn sync_port_advertised(&self) -> i64 {
+        let bound = self.sync_bound();
+        if bound != 0 {
+            return bound as i64;
+        }
+        self.config()
+            .get("syncPort")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(self.port as i64 + 1)
     }
 
     // ---------------------------------------------------------------- 附件原件

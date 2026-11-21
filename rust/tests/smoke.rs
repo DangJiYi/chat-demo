@@ -131,6 +131,30 @@ fn status_reports_version_and_dirs() {
     assert_eq!(body["port"], s.port);
     assert!(body["dataDir"].as_str().unwrap().contains("data"));
     assert!(body["platform"].is_string());
+
+    // 下面四个字段是界面「本机」区块的全部数据源。
+    // 少了任何一个，界面就只剩“未获取到（没连局域网？）”——
+    // 而那可能是服务端压根没返回这个字段，不是网络问题。
+    assert!(
+        body["localIps"].is_array(),
+        "localIps 必须是数组（界面拿 [0] 拼本端地址）: {body}"
+    );
+    let name = body["deviceName"].as_str();
+    assert!(
+        name.map(|n| !n.is_empty()).unwrap_or(false),
+        "deviceName 必须是非空字符串: {body}"
+    );
+    let sync_port = body["syncPort"].as_u64().expect("syncPort 必须是数字");
+    assert!(
+        (1024..=65535).contains(&sync_port),
+        "syncPort 越界: {sync_port}"
+    );
+    // 服务启动后同步端口就该在监听；没监听说明绑定失败，
+    // 界面会把一个连不上的地址告诉对端。
+    assert!(
+        body["syncListening"].as_bool().unwrap_or(false),
+        "同步端口未监听: {body}"
+    );
 }
 
 #[test]
@@ -617,7 +641,7 @@ fn frontend_local_db_prefix_is_served() {
         .into_reader()
         .read_to_end(&mut body)
         .expect("read");
-    assert_eq!(body.as_slice(), b"attachment-bytes");
+    assert_eq!(body, b"attachment-bytes".to_vec());
 
     // 重命名（db.ts 的 renameSession 走这条）
     let resp = ureq::post(&s.url("/local/db/session/p2/rename"))
