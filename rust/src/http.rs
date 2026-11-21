@@ -175,10 +175,27 @@ fn parse_session_path(path: &str) -> Option<(&str, bool)> {
     }
 }
 
-pub fn handle(mut req: Request, st: &Store, www: &Path, version: &str) {
+/// UI 端口的请求处理。
+///
+/// `st` 取 `&'static Store`：部分端点要把存储交给后台线程（立即同步、归档），
+/// 用 'static 引用能直接 move 进线程，不需要 unsafe transmute。
+/// 这也符合事实：Store 建在 main 里，存活期就是整个进程。
+pub fn handle(mut req: Request, st: &'static Store, www: &Path, version: &str) {
     let method = req.method().clone();
     let url = req.url().to_string();
-    let path = url.split('?').next().unwrap_or("/").to_string();
+    let raw_path = url.split('?').next().unwrap_or("/").to_string();
+
+    // 前端把「数据层」接口挂在 /local/db/*（见 src/services/chat/db.ts 里的 BASE），
+    // 而「本机设置」接口是 /local/*（见 src/local/api.ts）。Python 版在分发前
+    // 统一剥掉 /local 前缀，这里对数据层做同样的事。
+    //
+    // 不做这一步的后果不是 404 那么无害：db.ts 对 404 刻意不抛错（用来表达
+    // “这条会话不存在”），于是 404 的错误体被当成数组去 .map()，界面报的是
+    // “对话列表加载失败”——排查时完全看不出根因在路由前缀上。
+    let path = match raw_path.strip_prefix("/local/db") {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("/db{rest}"),
+        _ => raw_path,
+    };
 
     // ---------- /local/status ----------
     if method == Method::Get && path == "/local/status" {
@@ -193,7 +210,23 @@ pub fn handle(mut req: Request, st: &Store, www: &Path, version: &str) {
             #[serde(rename = "uptimeSec")]
             uptime_secs: u64,
             platform: String,
+            // 界面要拿这两个告诉用户「对端该填什么」和「本机叫什么」
+            #[serde(rename = "localIps")]
+            local_ips: Vec<String>,
+            #[serde(rename = "deviceName")]
+            device_name: String,
         }
+        let cfg = st.config();
+        let sync_port = cfg
+            .get("syncPort")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(st.port() as i64 + 1)
+            .clamp(1024, 65535) as u16;
+        let device_name = cfg
+            .get("deviceName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         send_json(
             req,
             200,
@@ -201,9 +234,11 @@ pub fn handle(mut req: Request, st: &Store, www: &Path, version: &str) {
                 version: version.to_string(),
                 data_dir: st.dir().display().to_string(),
                 port: st.port(),
-                sync_port: 8791,
+                sync_port,
                 uptime_secs: st.uptime_secs(),
                 platform: std::env::consts::OS.to_string(),
+                local_ips: crate::sync::local_ips(),
+                device_name,
             },
         );
         return;
@@ -251,14 +286,14 @@ pub fn handle(mut req: Request, st: &Store, www: &Path, version: &str) {
             log_bytes: u64,
         }
         let count = st.summaries().map(|v| v.len()).unwrap_or(0);
+        let archived = aggregate::list_archived(st).len();
         let log_path = st.dir().join("app.log");
         send_json(
             req,
             200,
             &Storage {
                 active_sessions: count,
-                // 归档计数需要 index.json，Rust 版尚未实现归档，先报 0
-                archived_sessions: 0,
+                archived_sessions: archived,
                 active_bytes: st.subdir_bytes("sessions") + st.subdir_bytes("meta"),
                 archive_bytes: st.subdir_bytes("archive"),
                 media_bytes: st.subdir_bytes("media"),
@@ -670,6 +705,218 @@ pub fn handle(mut req: Request, st: &Store, www: &Path, version: &str) {
         return;
     }
 
+    // ---------- /local/sync/status ----------
+    if path == "/local/sync/status" && method == Method::Get {
+        send_json(req, 200, &st.sync_state());
+        return;
+    }
+
+    // ---------- /local/sync/now ----------
+    if path == "/local/sync/now" && method == Method::Post {
+        let peer = st
+            .config()
+            .get("peer")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if peer.is_empty() {
+            send_error(req, 400, "还没填对端地址");
+            return;
+        }
+        // st 是 &'static store，可以直接 move 进线程
+        std::thread::spawn(move || crate::sync::pull_once(st));
+        send_json(req, 200, &serde_json::json!({ "started": true }));
+        return;
+    }
+
+    // ---------- /local/discover ----------
+    if path == "/local/discover" && method == Method::Get {
+        let peers = crate::sync::discover_peers(st, std::time::Duration::from_secs(2));
+        let cfg = st.config();
+        let name = cfg
+            .get("deviceName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let port = cfg
+            .get("syncPort")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(st.port() as i64 + 1);
+        send_json(
+            req,
+            200,
+            &serde_json::json!({
+                "peers": peers,
+                "self": {
+                    "name": name,
+                    "ips": crate::sync::local_ips(),
+                    "port": port,
+                }
+            }),
+        );
+        return;
+    }
+
+    // ---------- /local/pair ----------
+    if path == "/local/pair" && method == Method::Post {
+        let body = match read_body(&mut req) {
+            Ok(b) => b,
+            Err(e) => {
+                send_error(req, 400, &e);
+                return;
+            }
+        };
+        #[derive(serde::Deserialize)]
+        struct PairBody {
+            #[serde(default)]
+            ip: String,
+            port: Option<u16>,
+        }
+        let parsed = serde_json::from_slice::<PairBody>(&body).unwrap_or(PairBody {
+            ip: String::new(),
+            port: None,
+        });
+        let ip = parsed.ip.trim().to_string();
+        if ip.is_empty() {
+            send_error(req, 400, "缺少 ip");
+            return;
+        }
+        let port = parsed.port.unwrap_or(8791);
+        let peer = format!("{ip}:{port}");
+        let patch = serde_json::json!({ "peer": peer })
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let _ = st.save_config(&patch);
+
+        // 反向：请对端也指向本机。对端只会入待确认队列，不直接生效。
+        let mut reverse = "skipped".to_string();
+        if let Some(mine) = crate::sync::local_ips().into_iter().next() {
+            let my_port = st
+                .config()
+                .get("syncPort")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(st.port() as i64 + 1);
+            let my_name = st
+                .config()
+                .get("deviceName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let payload = serde_json::json!({ "ip": mine, "port": my_port, "name": my_name });
+            let url = format!("http://{ip}:{port}/peer");
+            match ureq::post(&url)
+                .timeout(std::time::Duration::from_secs(6))
+                .send_json(payload)
+            {
+                Ok(_) => reverse = "pending".to_string(),
+                Err(e) => reverse = format!("failed: {e}"),
+            }
+        }
+
+        std::thread::spawn(move || crate::sync::pull_once(st));
+        send_json(
+            req,
+            200,
+            &serde_json::json!({ "peer": peer, "reverse": reverse }),
+        );
+        return;
+    }
+
+    // ---------- /local/pair/requests ----------
+    if path == "/local/pair/requests" && method == Method::Get {
+        send_json(req, 200, &st.pair_requests());
+        return;
+    }
+
+    // ---------- /local/pair/accept ----------
+    if path == "/local/pair/accept" && method == Method::Post {
+        let body = match read_body(&mut req) {
+            Ok(b) => b,
+            Err(e) => {
+                send_error(req, 400, &e);
+                return;
+            }
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+        let ip = v
+            .get("ip")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(8791) as u16;
+        if ip.is_empty() {
+            send_error(req, 400, "缺少 ip");
+            return;
+        }
+        st.remove_pair_request(&ip, port);
+        let peer = format!("{ip}:{port}");
+        let patch = serde_json::json!({ "peer": peer })
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let _ = st.save_config(&patch);
+
+        std::thread::spawn(move || crate::sync::pull_once(st));
+        send_json(req, 200, &serde_json::json!({ "peer": peer }));
+        return;
+    }
+
+    // ---------- /local/pair/reject ----------
+    if path == "/local/pair/reject" && method == Method::Post {
+        let body = match read_body(&mut req) {
+            Ok(b) => b,
+            Err(e) => {
+                send_error(req, 400, &e);
+                return;
+            }
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+        let ip = v
+            .get("ip")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(8791) as u16;
+        st.remove_pair_request(&ip, port);
+        send_json(req, 200, &serde_json::json!({ "ok": true }));
+        return;
+    }
+
+    // ---------- /local/archive/now ----------
+    if path == "/local/archive/now" && method == Method::Post {
+        // 用户点「立即整理」才去重：显式动作，不在后台自动删东西
+        let (dropped, freed) = crate::archive::compact_archive(st).unwrap_or((0, 0));
+        match crate::archive::archive_once(st) {
+            Ok(n) => send_json(
+                req,
+                200,
+                &serde_json::json!({
+                    "archived": n,
+                    "dedupDropped": dropped,
+                    "dedupSavedBytes": freed,
+                }),
+            ),
+            Err(e) => send_error(req, 500, &e),
+        }
+        return;
+    }
+
+    // ---------- /local/images/now ----------
+    if path == "/local/images/now" && method == Method::Post {
+        match crate::archive::compact_images(st) {
+            Ok(r) => send_json(req, 200, &r),
+            Err(e) => send_error(req, 500, &e),
+        }
+        return;
+    }
+
+    // ---------- /local/orphans ----------
+    if path == "/local/orphans" && method == Method::Get {
+        send_json(req, 200, &crate::archive::orphan_media(st));
+        return;
+    }
+
     // ---------- 其余交给静态文件 ----------
     if method == Method::Get {
         serve_static(req, www, path.trim_start_matches('/'));
@@ -791,4 +1038,187 @@ fn fetch_balance(st: &Store) -> serde_json::Value {
     };
     st.cache_balance(Some(result.clone()));
     result
+}
+
+// ------------------------------------------------------------------ 同步端口
+
+/// 同步端口的请求处理。
+///
+/// 这里专处理「对端拉数据」与「配对请求」，**不暴露** UI 端口的那些能力：
+///   - 对端只知道我们的同步端口，不知道 UI 端口
+///   - 局域网内无鉴权，所以这里只给读同步数据 + 入队配对请求，
+///     改配置仍然要本机用户在界面上确认
+pub fn handle_sync(mut req: Request, st: &'static Store, version: &str) {
+    let method = req.method().clone();
+    let url = req.url().to_string();
+    let path = url.split('?').next().unwrap_or("/").to_string();
+
+    if path == "/health" && method == Method::Get {
+        #[derive(Serialize)]
+        struct Health {
+            ok: bool,
+            version: String,
+            platform: String,
+        }
+        send_json(
+            req,
+            200,
+            &Health {
+                ok: true,
+                version: version.to_string(),
+                platform: std::env::consts::OS.to_string(),
+            },
+        );
+        return;
+    }
+
+    if path == "/sync/since" && method == Method::Get {
+        let since = query_param(&url, "since")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        let mut sessions: Vec<serde_json::Value> = Vec::new();
+        for meta in st.summaries().unwrap_or_default() {
+            if meta.updated_at <= since {
+                continue;
+            }
+            if let Ok(Some(raw)) = st.load_session(&meta.id) {
+                if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                    sessions.push(doc);
+                }
+            }
+        }
+        // 墓碑也要发，否则对端不知道“这条被删了”
+        for meta in st.deleted_summaries().unwrap_or_default() {
+            if meta.updated_at <= since {
+                continue;
+            }
+            let mut doc = match st.load_session(&meta.id) {
+                Ok(Some(raw)) => serde_json::from_slice::<serde_json::Value>(&raw)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                _ => serde_json::json!({
+                    "id": meta.id,
+                    "title": meta.title,
+                    "createdAt": meta.created_at,
+                    "messages": [],
+                }),
+            };
+            if let Some(obj) = doc.as_object_mut() {
+                obj.insert("deleted".to_string(), serde_json::Value::Bool(true));
+                obj.insert(
+                    "updatedAt".to_string(),
+                    serde_json::Value::from(meta.updated_at),
+                );
+            }
+            sessions.push(doc);
+        }
+
+        let files: Vec<serde_json::Value> = st
+            .file_metas()
+            .into_iter()
+            .filter(|f| f.created_at > since)
+            .filter_map(|f| serde_json::to_value(f).ok())
+            .collect();
+
+        send_json(
+            req,
+            200,
+            &serde_json::json!({ "now": crate::store::now_ms(), "sessions": sessions, "files": files }),
+        );
+        return;
+    }
+
+    if path == "/sync/merge" && method == Method::Post {
+        let body = match read_body(&mut req) {
+            Ok(b) => b,
+            Err(e) => {
+                send_error(req, 400, &e);
+                return;
+            }
+        };
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+        let mut accepted = 0i64;
+        if let Some(arr) = payload.get("sessions").and_then(|v| v.as_array()) {
+            for doc in arr {
+                if let Ok(true) = crate::sync::merge_remote(st, doc) {
+                    accepted += 1;
+                }
+            }
+        }
+        send_json(
+            req,
+            200,
+            &serde_json::json!({ "accepted": accepted, "missing": [] }),
+        );
+        return;
+    }
+
+    // 配对请求：只入待确认队列，**不直接改配置**。
+    if (path == "/peer" || path == "/local/peer") && method == Method::Post {
+        let body = match read_body(&mut req) {
+            Ok(b) => b,
+            Err(e) => {
+                send_error(req, 400, &e);
+                return;
+            }
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+        let ip = v
+            .get("ip")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if ip.is_empty() {
+            send_error(req, 400, "缺少 ip");
+            return;
+        }
+        let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(8791) as u16;
+        let name: String = v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or(&ip)
+            .chars()
+            .take(64)
+            .collect();
+        st.add_pair_request(crate::sync::PairRequest {
+            ip,
+            port,
+            name,
+            at: crate::store::now_ms(),
+        });
+        send_json(req, 200, &serde_json::json!({ "pending": true }));
+        return;
+    }
+
+    // 按 sha 取原件（对端拉附件用）
+    if let Some(sha) = path.strip_prefix("/file/") {
+        if method != Method::Get || sha.is_empty() {
+            send_error(req, 404, "not found");
+            return;
+        }
+        // 只接受 64 位十六进制，避免路径穿越（对端传来的 sha 不可信）
+        if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            send_error(req, 400, "非法 sha");
+            return;
+        }
+        match std::fs::read(st.dir().join("media").join(sha)) {
+            Ok(data) => {
+                let _ = req.respond(
+                    Response::from_data(data)
+                        .with_status_code(StatusCode(200))
+                        .with_header(header(b"Content-Type", b"application/octet-stream"))
+                        .with_header(header(
+                            b"Cache-Control",
+                            b"public, max-age=31536000, immutable",
+                        )),
+                );
+            }
+            Err(_) => send_error(req, 404, "not found"),
+        }
+        return;
+    }
+
+    send_error(req, 404, "not found");
 }

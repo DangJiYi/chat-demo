@@ -75,12 +75,14 @@ spec 里是 `console=False`，所以 exe 不再弹控制台，而是常驻**系�
 `rust/` 是后端重写工程，目标是用一份代码同时覆盖 Windows exe 和安卓 `.so`，
 摆脱 Python 运行时（约省 13.6 MB）。
 
-**进度：静态文件 + 会话读写已实现。**
+**进度：Windows 侧功能已与 Python 版对齐（含同步、配对、归档）。**
+
+UI 端口（默认 8790，只听 `127.0.0.1`）：
 
 ```text
 GET    /                        静态文件（含 SPA fallback 与目录穿越防护）
 GET    /static/*                长缓存资源
-GET    /local/status            服务状态
+GET    /local/status            服务状态（含 localIps / deviceName）
 GET    /local/storage           存储占用
 GET    /local/config            读配置                PUT 改配置
 GET    /local/apikey            Key 状态            PUT 存 Key  DELETE 删除
@@ -90,6 +92,15 @@ GET    /local/search            全文搜索（活跃 + 归档）
 GET    /local/archived          归档列表
 POST   /local/restore/<id>      从归档恢复
 POST   /local/delete            批量删除（区分归档与会话）
+GET    /local/sync/status       同步状态            POST /local/sync/now 立即拉一次
+GET    /local/discover          UDP 广播找同网段设备
+POST   /local/pair              指向对端并反向请求配对
+GET    /local/pair/requests     待确认的配对请求
+POST   /local/pair/accept       接受配对（此时才写进配置）
+POST   /local/pair/reject       拒绝配对
+POST   /local/archive/now       立即归档 + 去重
+POST   /local/images/now        重压缩旧 PNG
+GET    /local/orphans           无人引用的附件（只统计）
 GET    /health                  存活检查
 GET    /db/summaries            会话摘要（扫目录，按 updatedAt 倒序）
 GET    /db/session/<id>         读会话原文
@@ -105,8 +116,38 @@ POST   /db/staging/filetypes    回填附件 MIME
 POST   /db/staging/commit       暂存 → 正式
 ```
 
-**已能替代 Python 版跑 Windows**（聊天、计费、搜索、归档全通）。
-还差：同步端口 8791、UDP 发现 8792、`/local/discover` 与 `/local/pair*`、安卓壳。
+同步端口（默认 UI 端口 + 1，听 `0.0.0.0`，对局域网开放）：
+
+```text
+GET  /health            存活检查
+GET  /sync/since?since= 增量拉取：会话 + 附件元数据 + 游标
+POST /sync/merge        推送合并
+POST /peer              配对请求（只入待确认队列，不改配置）
+GET  /file/<sha256>     按内容取附件原件
+```
+
+**没有鉴权**，所以同步端口只给「读同步数据 + 入队配对请求」；改配置必须由
+本机用户在界面上点接受。这一点和蓝牙配对是同一个道理。
+
+### 两条前缀，别弄混
+
+前端用两套前缀，服务端必须都认：
+
+- **`/local/*`** —— 本机设置类接口（`src/local/api.ts`）
+- **`/local/db/*`** —— 数据层接口（`src/services/chat/db.ts` 里 `BASE = '/local/db'`）
+
+Python 版的做法是分发前统一剥掉 `/local`，于是 `/local/db/summaries` 落到
+`/db/summaries`。Rust 版跟着做同样的事（源码里只写一次 `/db/*` 路由）。
+
+这东西踩过一次，值得写下来：漏剥前缀时不是「安静 404」，而是 ——
+`db.ts` 对 404 是刻意不抛错的（用来表达「这条会话不存在」），于是 404 的
+错误体被当成数组去 `.map()`，界面上报的是「对话列表加载失败」。
+排查时很难想到根因在路由前缀上。
+
+之前的 CI 全打 `/db/*`，所以这件事一路绿着进了产物。
+`tests/smoke.rs` 的 `frontend_local_db_prefix_is_served` 现在直接按前端真实路径断言。
+
+还差：安卓壳（`cargo-ndk` + 薄 Kotlin 层）。
 
 ### 计费口径与测试
 
@@ -128,6 +169,10 @@ POST   /db/staging/commit       暂存 → 正式
 `tests/smoke.rs` 起真实二进制、发真实 HTTP 请求，覆盖静态文件、会话 CRUD、
 附件内容寻址、导入暂存、配置、Key、用量、搜索、归档恢复。
 
+`tests/sync_e2e.rs` 起**两个**实例（A、B 各占一个端口），让 A 去拉 B：
+会话（含回答）、附件（要说按 id 读得回来，不只是落盘）、配对队列（请求不得
+擅自改配置，接受后才生效）、归档（旧会话搬走并从活跃列表消失）。
+
 断言放在 Rust 里而不是 CI 的 YAML 里：YAML 里的 PowerShell 断言很难写对类型
 （`byte[]` vs `string`、`@()` 包数组、`Uri` 预先规范化 `..`），而且只有推上去才知道错。
 
@@ -146,8 +191,9 @@ POST   /db/staging/commit       暂存 → 正式
    `cargo build` 会在链接阶段失败
 2. 执行 `cargo build` 会在工作区里跑构建脚本，权限策略会拦
 
-`.github/workflows/rust.yml` 做四件事：`clippy -D warnings` → `cargo build --release`
-→ **真实启动服务并用 HTTP 请求断言** → 上传 exe artifact。
+`.github/workflows/rust.yml` 做四件事：`clippy`（只把 correctness/suspicious
+两组当错误，其余风格问题不拦）→ `cargo test`（单测 + 两个端到端测试）
+→ `cargo build --release` → **真实启动服务并用 HTTP 请求断言** → 上传 exe artifact。
 
 自检不只验证“能编译”，而是真的造两个会话文件、起服务、请求两个端点，
 断言：返回 2 条、按 `updatedAt` 倒序（s2 在前）、中文标题正确、未知路径返回 404。
@@ -178,6 +224,22 @@ CI 里有条回归断言专门盯这个：在上级放一个诱饵 `data/`，断
 ```bash
 dsh-chat --port 8790 --data <数据目录> --www <前端目录>
 ```
+
+### Windows 上的托盘与日志
+
+双击 exe 不再是一个关不掉的黑框：托盘图标右键有「打开界面 / 退出」，
+双击图标直接开界面。几个刻意的设计：
+
+- **先加图标，再加隐藏控制台**。顺序反了，一旦托盘创建失败（explorer 没起来），
+  用户会看到一个既没有窗口也没有图标、只在后台吃端口的进程。
+- **控制台只有「独占」时才隐藏**（`GetConsoleProcessList` 返回 1）。
+  从 PowerShell / Git Bash 启动时，那个窗口是终端自己的，藏了会连带把终端藏掉。
+- **`--console` 保留黑框**。排查启动问题时用。
+- **日志在 `data/app.log`**（超 1 MB 轮转成 `app.log.1`）。控制台藏了就只能靠它：
+  启动参数、同步失败原因、归档结果都写在这里，界面的「存储占用」也显示它的大小。
+  同步失败只在**错误内容变化**时记一行——对端离线时每 3 秒重试一次，
+  逐次记录会把日志刷满。
+- 托盘只用 `windows-sys` 里几个系统调用，不引 GUI 框架；图标暂时是系统默认图标。
 
 ### 设计约束
 

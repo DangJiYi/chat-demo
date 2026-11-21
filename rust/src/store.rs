@@ -12,8 +12,12 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use std::sync::Mutex;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::sync::{PairRequest, SyncState};
 
 /// 单个会话文件的大小上限，与 Python 版一致（32 MB）。
 const MAX_SESSION: u64 = 32 << 20;
@@ -180,7 +184,11 @@ pub struct Store {
     started: Instant,
     /// 余额缓存：(取到的时间戳毫秒, 结果)。余额接口 60 秒内不重查，
     /// 与 Python 版 balance_cache 的行为一致。
-    balance_cache: std::sync::Mutex<(i64, Option<serde_json::Value>)>,
+    balance_cache: Mutex<(i64, Option<serde_json::Value>)>,
+    /// 同步运行状态（供 /local/sync/status）。
+    sync: Mutex<SyncState>,
+    /// 待本机确认的配对请求。
+    pair_requests: Mutex<Vec<PairRequest>>,
 }
 impl Store {
     /// 建好目录结构。已存在则什么也不做（与 Python 版一致）。
@@ -200,7 +208,9 @@ impl Store {
             dir,
             port,
             started: Instant::now(),
-            balance_cache: std::sync::Mutex::new((0, None)),
+            balance_cache: Mutex::new((0, None)),
+            sync: Mutex::new(SyncState::default()),
+            pair_requests: Mutex::new(Vec::new()),
         })
     }
 
@@ -257,6 +267,37 @@ impl Store {
         }
 
         // 按 updatedAt 倒序；相同时间戳时按 id 排，保证输出稳定
+        out.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(out)
+    }
+
+    /// 已删除（写墓碑）的会话摘要，按 updatedAt 倒序。
+    /// 同步时要把墓碑也发给对端，否则对端不知道「这条被删了」。
+    pub fn deleted_summaries(&self) -> io::Result<Vec<SessionSummary>> {
+        let mut out = Vec::new();
+        let dir = self.dir.join("sessions");
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(raw) = fs::read(&path) else { continue };
+            let Some(parsed) = parse_session(&raw) else {
+                continue;
+            };
+            if parsed.deleted {
+                out.push(parsed.summary);
+            }
+        }
         out.sort_by(|a, b| {
             b.updated_at
                 .cmp(&a.updated_at)
@@ -380,6 +421,12 @@ impl Store {
         if img_days < 0 {
             cfg.insert("imageDays".into(), serde_json::json!(14));
         }
+        // 同步端口：越界就回落到默认（UI 端口 + 1）。
+        // 不校的话，存了脏值会让端口根本绑不上，界面却仍显示那个数字。
+        let sync_port = cfg.get("syncPort").and_then(|v| v.as_i64()).unwrap_or(0);
+        if !(1024..=65535).contains(&sync_port) {
+            cfg.insert("syncPort".into(), serde_json::json!(self.port as i64 + 1));
+        }
         cfg
     }
 
@@ -436,6 +483,62 @@ impl Store {
         if let Ok(mut guard) = self.balance_cache.lock() {
             *guard = (now_ms(), data);
         }
+    }
+
+    // ---------------------------------------------------------------- 同步状态
+
+    pub fn sync_state(&self) -> SyncState {
+        self.sync.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// 就地修改同步状态。锁中毒时静默忽略（宁可不更新状态，也不要 panic）。
+    pub fn set_sync_state(&self, f: impl FnOnce(&mut SyncState)) {
+        if let Ok(mut g) = self.sync.lock() {
+            f(&mut g);
+        }
+    }
+
+    pub fn pair_requests(&self) -> Vec<PairRequest> {
+        self.pair_requests
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// 收到配对请求：同 ip:port 的旧请求先移除，再追加（保留最新）。
+    pub fn add_pair_request(&self, req: PairRequest) {
+        if let Ok(mut g) = self.pair_requests.lock() {
+            g.retain(|r| !(r.ip == req.ip && r.port == req.port));
+            g.push(req);
+        }
+    }
+
+    pub fn remove_pair_request(&self, ip: &str, port: u16) {
+        if let Ok(mut g) = self.pair_requests.lock() {
+            g.retain(|r| !(r.ip == ip && r.port == port));
+        }
+    }
+
+    // ---------------------------------------------------------------- 附件原件
+
+    /// media/<sha> 是否已存在。
+    pub fn has_media(&self, sha: &str) -> bool {
+        // 只接受 64 位十六进制，避免路径穿越（对端传来的 sha 不可信）
+        if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+        self.dir.join("media").join(sha).is_file()
+    }
+
+    /// 直接按 sha 写原件（同步拉取用；不建 id 索引，只保证字节到位）。
+    ///
+    /// 一般走 `put_file` 把 id 一起登记；这里留作“只搬运原件”的低层入口。
+    #[allow(dead_code)]
+    pub fn put_media_raw(&self, sha: &str, data: &[u8]) -> io::Result<()> {
+        if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "非法 sha"));
+        }
+        atomic_write(&self.dir.join("media").join(sha), data)
     }
 
     // ---------------------------------------------------------------- 附件
@@ -530,6 +633,30 @@ impl Store {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(format!("读取失败: {e}")),
         }
+    }
+
+    /// 全部附件元数据（给压缩图片、孤儿统计用）。
+    pub fn file_metas(&self) -> Vec<FileMeta> {
+        self.load_files_index()
+            .values()
+            .filter_map(|v| serde_json::from_value::<FileMeta>(v.clone()).ok())
+            .collect()
+    }
+
+    /// 索引里是否已经有这个附件 id。
+    ///
+    /// 同步拉附件时用：原件可能早就在 media/ 里（内容寻址，另一个 id 用过），
+    /// 但本机的 index 还没登记这个 id，那样界面按 id 取会 404。
+    pub fn has_file(&self, fid: &str) -> bool {
+        self.load_files_index().contains_key(fid)
+    }
+
+    /// 除了 `fid` 之外，是否还有别的附件记录指向同一个 sha。
+    /// 内容寻址下多个 id 可能共用一份原件，删之前必须确认。
+    pub fn media_referenced_by_other(&self, fid: &str, sha: &str) -> bool {
+        self.load_files_index().iter().any(|(other_id, v)| {
+            other_id != fid && v.get("sha").and_then(|s| s.as_str()) == Some(sha)
+        })
     }
 
     // ---------------------------------------------------------------- 导入暂存

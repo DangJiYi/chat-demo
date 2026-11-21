@@ -46,25 +46,11 @@ fn archived_ids(store: &Store) -> Vec<ArchivedItem> {
         .unwrap_or_default()
 }
 
-/// 读归档 JSONL 里的所有会话文档。
-///
-/// 归档是「追加 gzip member」写的，一个文件里可能有同一会话的多份；
-/// 调用方需要时自己按 archivedAt 去重。
+/// 读归档 JSONL 里的所有会话文档（委托给 archive 模块，避免两份实现漂移）。
 fn read_archive_docs(store: &Store, name: &str) -> Vec<serde_json::Value> {
-    let path = store.dir().join("archive").join(name);
-    let file = match fs::File::open(&path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-    // 多个 gzip member 串联的流，MultiGzDecoder 会一直读到 EOF
-    let mut decoder = flate2::read::MultiGzDecoder::new(file);
-    let mut text = String::new();
-    if decoder.read_to_string(&mut text).is_err() {
-        return Vec::new();
-    }
-    text.lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter_map(|env| env.get("session").cloned())
+    crate::archive::read_archive_docs(store, name)
+        .into_iter()
+        .map(|(_, doc)| doc)
         .collect()
 }
 

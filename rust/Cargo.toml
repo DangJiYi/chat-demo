@@ -23,6 +23,18 @@ flate2 = "1"
 # json 特性提供 into_json()，测试和余额解析都要用。
 ureq = { version = "2", default-features = false, features = ["native-tls", "json"] }
 
+# 托盘图标：只用系统 API，不引 GUI 框架。
+# windows-sys 是纯绑定（几乎不增体积），比手写 extern 声明安全——
+# 像 NOTIFYICONDATAW 这种结构体，字段少了会在 Shell_NotifyIconW 里踩内存。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 # 体积优先：opt-level=z + LTO + strip，panic=abort 去掉展开表
 [profile.release]
 opt-level = "z"

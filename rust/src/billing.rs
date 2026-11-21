@@ -69,6 +69,12 @@ pub fn bj_date_key(ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// `YYYY-MM-DD HH:MM`（北京时间），用于日志时间戳。
+pub fn bj_time_key(ms: i64) -> String {
+    let (y, m, d, hh, mm) = bj_parts(ms);
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+}
+
 /// YYYY-MM，用于按月分桶。
 pub fn bj_month_key(ms: i64) -> String {
     let (y, m, _, _, _) = bj_parts(ms);

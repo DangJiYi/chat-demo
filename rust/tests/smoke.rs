@@ -7,7 +7,7 @@
 //!
 //! 每个测试起一个独立实例（独立端口 + 独立临时目录），互不影响。
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -562,4 +562,108 @@ fn unknown_path_falls_back_to_spa() {
     let resp = ureq::get(&s.url("/local/nonexistent")).call().expect("fallback");
     assert_eq!(resp.status(), 200);
     assert!(resp.into_string().unwrap().contains("id=root"));
+}
+
+/// 前端真实使用的路径是 `/local/db/*`（见 `src/services/chat/db.ts` 的 `BASE`），
+/// 不是 `/db/*`。
+///
+/// 之前所有断言都直接打 `/db/*`，所以「数据层整个 404」这种致命问题
+/// 一路绿着进了产物：界面上表现为「对话列表加载失败」，看不出是前缀问题。
+/// 这组断言就盯住这条契约。
+#[test]
+fn frontend_local_db_prefix_is_served() {
+    let s = start(true);
+    write_session(&s.data(), "p1", "本地会话", 2000);
+
+    // 列表
+    let raw = ureq::get(&s.url("/local/db/summaries"))
+        .call()
+        .expect("GET /local/db/summaries")
+        .into_string()
+        .expect("text");
+    assert!(
+        raw.trim_start().starts_with('['),
+        "应返回数组，实际: {raw}"
+    );
+    let list: Vec<serde_json::Value> = serde_json::from_str(&raw).expect("parse");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], "p1");
+
+    // 读单条
+    let one = ureq::get(&s.url("/local/db/session/p1"))
+        .call()
+        .expect("GET /local/db/session/p1")
+        .into_json::<serde_json::Value>()
+        .expect("json");
+    assert_eq!(one["title"], "本地会话");
+
+    // 写单条
+    let doc = r#"{"id":"p2","title":"新建","createdAt":3000,"updatedAt":3000,"messages":[]}"#;
+    let resp = ureq::put(&s.url("/local/db/session/p2"))
+        .send_string(doc)
+        .expect("PUT");
+    assert_eq!(resp.status(), 204);
+    assert_file(&s.data(), "sessions/p2.json");
+
+    // 附件：PUT 后按 id 读回
+    ureq::put(&s.url("/local/db/file/att9"))
+        .set("Content-Type", "text/plain")
+        .send_bytes(b"attachment-bytes")
+        .expect("PUT file");
+    let mut body = Vec::new();
+    ureq::get(&s.url("/local/db/file/att9"))
+        .call()
+        .expect("GET file")
+        .into_reader()
+        .read_to_end(&mut body)
+        .expect("read");
+    assert_eq!(body.as_slice(), b"attachment-bytes");
+
+    // 重命名（db.ts 的 renameSession 走这条）
+    let resp = ureq::post(&s.url("/local/db/session/p2/rename"))
+        .send_string(r#"{"title":"改过了"}"#)
+        .expect("rename");
+    assert_eq!(resp.status(), 204);
+    let after = ureq::get(&s.url("/local/db/session/p2"))
+        .call()
+        .unwrap()
+        .into_json::<serde_json::Value>()
+        .unwrap();
+    assert_eq!(after["title"], "改过了");
+
+    // 删除写墓碑，且从列表消失
+    assert_eq!(
+        status(ureq::delete(&s.url("/local/db/session/p2")).call()),
+        204
+    );
+    let raw = ureq::get(&s.url("/local/db/summaries"))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(!raw.contains("\"p2\""), "墓碑不应出现在列表里: {raw}");
+
+    // 导入暂存：清空 / 暂存 / 提交
+    assert_eq!(
+        status(ureq::post(&s.url("/local/db/staging/clear")).send_string("")),
+        204
+    );
+    let stg = r#"{"id":"imp2","title":"导入的","createdAt":4000,"updatedAt":4000,"messages":[]}"#;
+    assert_eq!(
+        status(ureq::put(&s.url("/local/db/staging/session/imp2")).send_string(stg)),
+        204
+    );
+    let committed = ureq::post(&s.url("/local/db/staging/commit"))
+        .send_string("")
+        .expect("commit")
+        .into_json::<Vec<serde_json::Value>>()
+        .expect("json");
+    assert_eq!(committed.len(), 1);
+    assert_file(&s.data(), "sessions/imp2.json");
+
+    // 不在 /local 下的老路径仍然可用（Python 版两条都通，别把它弄坏）
+    let legacy = ureq::get(&s.url("/db/summaries"))
+        .call()
+        .expect("GET /db/summaries");
+    assert_eq!(legacy.status(), 200);
 }
