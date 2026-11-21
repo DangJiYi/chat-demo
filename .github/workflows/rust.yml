@@ -67,12 +67,23 @@ jobs:
             }
             Write-Host ("/local/status -> " + ($r | ConvertTo-Json -Compress))
 
-            $s = @(Invoke-RestMethod -Uri "http://127.0.0.1:8799/db/summaries" -TimeoutSec 5)
-            Write-Host ("/db/summaries -> " + ($s | ConvertTo-Json -Compress))
+            # 不要用 @(Invoke-RestMethod ...)：它把整个 JSON 数组当成一个对象输出，
+            # @() 再包一层就成了「含数组的数组」，.Count 恒为 1（上一轮就是这么误报的）。
+            # 先取原文再解析，并显式断言原文是数组，同时把出参打印出来便于排查。
+            $raw = (Invoke-WebRequest -Uri "http://127.0.0.1:8799/db/summaries" -TimeoutSec 5).Content
+            Write-Host ("/db/summaries raw -> " + $raw)
+            if (-not $raw.TrimStart().StartsWith('[')) {
+              throw "期望返回 JSON 数组，实际开头是: $($raw.Substring(0, [Math]::Min(60, $raw.Length)))"
+            }
+            $s = @($raw | ConvertFrom-Json)
+            Write-Host ("条目数 -> " + $s.Count)
 
             if ($s.Count -ne 2) { throw "期望 2 条会话，实际 $($s.Count)" }
             if ($s[0].id -ne 's2') { throw "应按 updatedAt 倒序，首条应是 s2，实际 $($s[0].id)" }
+            if ($s[1].id -ne 's1') { throw "次条应是 s1，实际 $($s[1].id)" }
             if ($s[0].title -ne '会话二') { throw "UTF-8 标题解析错误: $($s[0].title)" }
+            if ($s[0].updatedAt -ne 3000) { throw "updatedAt 字段名/值不对（应为 camelCase 的 3000），实际 $($s[0].updatedAt)" }
+            if ($s[0].createdAt -ne 1000) { throw "createdAt 字段名/值不对（应为 camelCase 的 1000），实际 $($s[0].createdAt)" }
 
             $code = (Invoke-WebRequest -Uri "http://127.0.0.1:8799/nope" -SkipHttpErrorCheck).StatusCode
             if ($code -ne 404) { throw "未知路径应返回 404，实际 $code" }
