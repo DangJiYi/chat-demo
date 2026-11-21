@@ -158,6 +158,30 @@ GET  /file/<sha256>     按内容取附件原件
   串行处理会让自动保存、侧边栏状态查询全卡住——表现为「一提问界面就死」。
 - 附件上传按 128 MB 上限读请求体（与会话的 32 MB 分开）。
 
+#### TLS：一个很容易踩穿的点
+
+ureq 的 `native-tls` 特性**不会自动成为默认 TLS 后端**。它自己的源码里写着：
+
+> native-tls is a feature that must be configured via the AgentBuilder.
+> it is never picked up as a default (and never used by `ureq::get` etc).
+
+只开 feature 不传连接器，任何 HTTPS 请求都会在运行时失败：
+
+```
+Unknown Scheme: cannot make HTTPS request because no TLS backend is configured
+```
+
+所以有两个 agent 构造器，不要直接用 `ureq::get` 之类的快捷函数：
+
+- `http::upstream_agent(...)` —— 发往 `api.deepseek.com`（余额、代理），
+  带系统 TLS + 读系统代理（`HTTP_PROXY` 等，与 Python 的 urllib 一致）。
+- `sync::lan_agent(...)` —— 发往局域网对端，**刻意关掉系统代理**：
+  对端在 10.x/192.168.x，走代理会送到公司代理/科学上网去。
+
+`http.rs` 里有个单测 `tls_backend_is_configured` 守着这一条：
+它不联网，只断言 `native_tls::TlsConnector::new()` 能成功。
+丢了 TLS 配置时测试直接红，不用等到用户发现聊天全挂。
+
 ### 两条前缀，别弄混
 
 前端用两套前缀，服务端必须都认：

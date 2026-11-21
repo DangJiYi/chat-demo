@@ -828,8 +828,10 @@ pub fn handle(mut req: Request, st: &'static Store, www: &Path, version: &str) {
                 .to_string();
             let payload = serde_json::json!({ "ip": mine, "port": my_port, "name": my_name });
             let url = format!("http://{ip}:{port}/peer");
-            match ureq::post(&url)
-                .timeout(std::time::Duration::from_secs(6))
+            // 用局域网 agent：不开系统代理（对端在 10.x/192.168.x），
+            // 也不依赖任何 TLS 设置，只求 6 秒内把请求发出去。
+            match crate::sync::lan_agent(std::time::Duration::from_secs(6))
+                .post(&url)
                 .send_json(payload)
             {
                 Ok(_) => reverse = "pending".to_string(),
@@ -988,6 +990,50 @@ const UPSTREAM_HOST: &str = "api.deepseek.com";
 /// 前端 localStorage 里的占位值，表示「用服务端保存的 Key」。
 const KEY_SENTINEL: &str = "__server__";
 
+/// 系统的 TLS 连接器（Windows 走 Schannel），全局只建一次。
+///
+/// **必须显式传给 AgentBuilder。** ureq 自己的注释写得清楚：
+/// > native-tls is a feature that must be configured via the AgentBuilder.
+/// > it is never picked up as a default (and never used by `ureq::get` etc).
+///
+/// 不开 rustls（`tls` 特性）时，默认后端是个只会抛错的 NoTlsConfig，
+/// 所有 HTTPS 请求都返回：
+/// "cannot make HTTPS request because no TLS backend is configured"。
+/// 表现就是聊天、余额、模型列表全部失败——而且看起来像网络问题。
+pub(crate) fn tls_connector() -> Option<std::sync::Arc<ureq::native_tls::TlsConnector>> {
+    static CACHE: std::sync::OnceLock<Option<std::sync::Arc<ureq::native_tls::TlsConnector>>> =
+        std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            ureq::native_tls::TlsConnector::new()
+                .ok()
+                .map(std::sync::Arc::new)
+        })
+        .clone()
+}
+
+/// 建一个走系统代理 + 系统 TLS 的 agent（发往上游的请求用）。
+///
+/// 余额和代理两条路径都必须用它：`ureq::get` 之类的快捷函数只能用
+/// 默认 TLS（未开 rustls 时就是个只会报错的空实现）。
+pub(crate) fn upstream_agent(
+    connect: std::time::Duration,
+    read: std::time::Duration,
+) -> ureq::Agent {
+    let mut builder = ureq::AgentBuilder::new()
+        .timeout_connect(connect)
+        .timeout_read(read)
+        .timeout_write(std::time::Duration::from_secs(60))
+        // 跟 Python 版一致：读 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY
+        .try_proxy_from_env(true)
+        // 不跟重定向：让调用方看到真实状态码，避免静默改路由
+        .redirects(0);
+    if let Some(tc) = tls_connector() {
+        builder = builder.tls_connector(tc);
+    }
+    builder.build()
+}
+
 /// 把请求转发到上游，**流式**回传响应。
 ///
 /// 必须流式：聊天走 SSE，如果先收完整个响应再返回，界面要等到回答结束
@@ -1063,18 +1109,11 @@ fn proxy(mut req: Request, url: &str, st: &Store) {
         }
     };
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(10))
+    let agent = upstream_agent(
+        std::time::Duration::from_secs(10),
         // 读超时按“多久没收到数据”算，聊天流只要还在出字就不会被切断
-        .timeout_read(std::time::Duration::from_secs(600))
-        .timeout_write(std::time::Duration::from_secs(60))
-        // 跟 Python 版一致：读 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY。
-        // 用系统代理的用户，不读这两个变量的话所有请求都直连——
-        // 表现就是“浏览器能用、客户端不能用”。
-        .try_proxy_from_env(true)
-        // 不跟重定向：上游若有跳转，交给前端看到真实状态码，避免静默改路由
-        .redirects(0)
-        .build();
+        std::time::Duration::from_secs(600),
+    );
 
     let target = format!("https://{UPSTREAM_HOST}{url}");
     let mut call = agent.request(method.as_str(), &target);
@@ -1234,10 +1273,16 @@ fn fetch_balance(st: &Store) -> serde_json::Value {
     }
 
     const URL: &str = "https://api.deepseek.com/user/balance";
-    let result = match ureq::get(URL)
+    // 不能用 `ureq::get` 快捷函数：它用默认 TLS 后端（未开 rustls 时就是个
+    // 只会报错的 NoTlsConfig），拿不到我们配置的 native-tls。
+    let agent = upstream_agent(
+        std::time::Duration::from_secs(8),
+        std::time::Duration::from_secs(8),
+    );
+    let result = match agent
+        .get(URL)
         .set("Authorization", &format!("Bearer {key}"))
         .set("Accept", "application/json")
-        .timeout(std::time::Duration::from_secs(8))
         .call()
     {
         Ok(resp) => match resp.into_json::<serde_json::Value>() {
@@ -1467,4 +1512,36 @@ pub fn handle_sync(mut req: Request, st: &'static Store, version: &str) {
     }
 
     send_error(req, 404, "not found");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 守住一个真实踩过的坑。
+    ///
+    /// ureq 的 `native-tls` **不会自动成为默认 TLS 后端**，必须显式传给
+    /// AgentBuilder。漏了它，所有 HTTPS 请求都会报
+    /// “no TLS backend is configured”，而报错发生在运行时——
+    /// 表现是聊天、余额、校验 Key 全部失败，看上去像网络问题。
+    ///
+    /// 这个断言不需要联网：只要 TLS 后端能初始化就算通过。
+    #[test]
+    fn tls_backend_is_configured() {
+        assert!(
+            tls_connector().is_some(),
+            "native-tls 初始化失败：上游 HTTPS 请求会全部报 no TLS backend"
+        );
+    }
+
+    /// 代理路径必须精确匹配，不能把 /modelsx、/v1abc 也当成代理。
+    #[test]
+    fn proxy_path_matching_is_exact() {
+        for p in ["/models", "/anthropic/v1/messages", "/v1/tools"] {
+            assert!(is_proxy_path(p), "应识别为代理路径: {p}");
+        }
+        for p in ["/modelsx", "/v1abc", "/anthropic", "/v1", "/"] {
+            assert!(!is_proxy_path(p), "不该识别为代理路径: {p}");
+        }
+    }
 }

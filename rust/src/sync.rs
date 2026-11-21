@@ -460,6 +460,26 @@ pub fn discovery_server(store: &'static Store) {
 
 // ------------------------------------------------------------------ 拉取
 
+/// 访问局域网对端用的 agent。
+///
+/// **刻意关掉系统代理。** 对端在局域网内（10.x / 192.168.x），
+/// 走 HTTP_PROXY 会把请求送到公司代理/科学上网代理上，那里当然找不到对端；
+/// Python 版的 urllib 就会读环境变量，所以“浏览器能配同步、命令行不行”这类
+/// 怪现象往往出在这里。
+///
+/// 仍然带上 TLS 连接器：万一用户给对端写了 https://，不至于报
+/// “no TLS backend is configured” 这种看不出原因的错。
+pub(crate) fn lan_agent(timeout: Duration) -> ureq::Agent {
+    let mut builder = ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .try_proxy_from_env(false)
+        .redirects(0);
+    if let Some(tc) = crate::http::tls_connector() {
+        builder = builder.tls_connector(tc);
+    }
+    builder.build()
+}
+
 /// 拉一次对端数据。失败只记录在状态里，不抛错（同步是尽力而为）。
 ///
 /// 拿不到锁时会等（手动点「立即同步」就应该真的跑一趟）。
@@ -501,9 +521,7 @@ fn pull_locked(store: &Store) {
     let since = (cursor - SYNC_LOOKBACK_MS).max(0);
     let url = format!("{base}/sync/since?since={since}");
 
-    let resp = ureq::get(&url)
-        .timeout(Duration::from_secs(8))
-        .call();
+    let resp = lan_agent(Duration::from_secs(8)).get(&url).call();
     let data = match resp {
         Ok(r) => match r.into_json::<serde_json::Value>() {
             Ok(v) => v,
@@ -545,7 +563,7 @@ fn pull_locked(store: &Store) {
                 std::fs::read(store.dir().join("media").join(&meta.sha)).ok()
             } else {
                 let file_url = format!("{base}/file/{}", meta.sha);
-                match ureq::get(&file_url).timeout(Duration::from_secs(30)).call() {
+                match lan_agent(Duration::from_secs(30)).get(&file_url).call() {
                     Ok(r) => {
                         let mut buf = Vec::new();
                         match r.into_reader().read_to_end(&mut buf) {
