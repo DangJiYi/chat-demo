@@ -1511,8 +1511,10 @@ pub fn handle_sync(mut req: Request, st: &'static Store, version: &str) {
             .unwrap_or("")
             .trim()
             .to_string();
-        let ip = match observed_ip {
-            Some(o) if !o.is_empty() => o,
+        // 用 as_deref 取借用：observed_ip 后面还要用来记日志（自报与实测不一致时），
+        // 直接 `match observed_ip` 会把 String 移走（E0382 partial move）。
+        let ip = match observed_ip.as_deref() {
+            Some(o) if !o.is_empty() => o.to_string(),
             _ => reported_ip.clone(),
         };
         if ip.is_empty() {
@@ -1537,8 +1539,8 @@ pub fn handle_sync(mut req: Request, st: &'static Store, version: &str) {
             .chars()
             .take(64)
             .collect();
-        if let Some(o) = &observed_ip {
-            if !reported_ip.is_empty() && reported_ip != *o {
+        if let Some(o) = observed_ip.as_deref() {
+            if !reported_ip.is_empty() && reported_ip != o {
                 applog::write(
                     st,
                     &format!("配对请求：对端自报 {reported_ip}，实际来自 {o}，按实际地址配对"),

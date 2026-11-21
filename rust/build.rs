@@ -42,8 +42,11 @@ fn main() {
     src.push_str("// 由 build.rs 生成，请勿手改。\n");
     src.push_str("pub static EMBEDDED_WWW: &[(&str, &[u8])] = &[\n");
     for (rel, abs) in &files {
-        // {:?} 会产出合法的 Rust 字符串字面量（反斜杠会转义），正好给 include_bytes!
-        src.push_str(&format!("    ({:?}, include_bytes!({:?})),\n", rel, abs));
+        // 先转成 String 再 {:?}：String 的 Debug 一定会输出带转义的字符串字面量
+        // （{Windows 路径的 `\` → `\\`），正好是 include_bytes! 要的形式。
+        // 直接在 PathBuf 上 {:?} 依赖 OsStr 的 Debug 实现，不想赌它。
+        let abs_s: String = abs.to_string_lossy().into_owned();
+        src.push_str(&format!("    ({rel:?}, include_bytes!({abs_s:?}))),\n"));
     }
     src.push_str("];\n");
 
