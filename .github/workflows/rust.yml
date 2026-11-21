@@ -67,7 +67,7 @@ jobs:
           Set-Content -Encoding utf8 "www\index.html" '<!doctype html><title>t</title><div id=root></div>'
           Set-Content -Encoding utf8 "www\static\js\app.js" 'console.log(1)'
 
-          $p = Start-Process -FilePath $exe -ArgumentList '--port','8799','--data','data','--www','www' `
+          $p = Start-Process -FilePath $exe -ArgumentList '--port','8799','--data','data','--www','www','--no-open','--console' `
                -PassThru -NoNewWindow -RedirectStandardOutput "out.txt"
           try {
             $ok = $false
@@ -230,7 +230,7 @@ jobs:
           Set-Content -Encoding utf8 (Join-Path $layout 'www\index.html') '<div id=root>x</div>'
           Copy-Item $exe (Join-Path $bin 'dsh-chat.exe')
           Push-Location $env:RUNNER_TEMP
-          $p2 = Start-Process -FilePath (Join-Path $bin 'dsh-chat.exe') -ArgumentList '--port','8798' -PassThru -NoNewWindow -RedirectStandardOutput 'out2.txt'
+          $p2 = Start-Process -FilePath (Join-Path $bin 'dsh-chat.exe') -ArgumentList '--port','8798','--no-open','--console' -PassThru -NoNewWindow -RedirectStandardOutput 'out2.txt'
           try {
             $st2 = $null
             for ($i = 0; $i -lt 40; $i++) {

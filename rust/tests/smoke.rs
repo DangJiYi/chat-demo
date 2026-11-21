@@ -98,6 +98,10 @@ fn try_start(with_www: bool, attempt: u32) -> Option<TestServer> {
         .arg(dir.join("data"))
         .arg("--www")
         .arg(dir.join("www"))
+        // 测试必须无界面：不然每个用例都会弹浏览器、建托盘图标，
+        // CI 上还会因为“没有交互桌面”而走到奇怪的分支。
+        .arg("--no-open")
+        .arg("--console")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -164,7 +168,7 @@ fn status_reports_version_and_dirs() {
     let s = start(true);
     let resp = ureq::get(&s.url("/local/status")).call().expect("status");
     let body: serde_json::Value = resp.into_json().expect("json");
-    assert_eq!(body["version"], "0.2.1");
+    assert_eq!(body["version"], "0.2.2");
     assert_eq!(body["port"], s.port);
     assert!(body["dataDir"].as_str().unwrap().contains("data"));
     assert!(body["platform"].is_string());
@@ -796,4 +800,49 @@ fn proxy_paths_are_routed_not_404() {
     // 反过来：真的未知路径不能被误当代理（仍走 SPA 回退）
     let code = status(ureq::get(&s.url("/modelsx")).call());
     assert_eq!(code, 200, "/modelsx 不是代理路径，应走 SPA 回退，实际 {code}");
+}
+
+/// 单 exe 发布的核心保证：**没有 www 目录也能出界面**。
+///
+/// `build.rs` 把 `chat/www/` 内嵌进二进制，所以即使磁盘上没 index.html，
+/// `/` 也应该返回真界面（带 `<div id="root">`），而不是 500。
+///
+/// 反过来：谁把内嵌逻辑搞坏了（build.rs 漏文件、serve_static 顺序错），
+/// 这个用例会直接红，不用等用户下载后发现是白屏。
+#[test]
+fn serves_embedded_ui_without_www_dir() {
+    // with_www = false：不动磁盘上的 index.html
+    let s = start(false);
+
+    let resp = ureq::get(&s.url("/")).call().expect("GET /");
+    assert_eq!(resp.status(), 200, "没有 www 时应从内嵌资源返回首页");
+    let body = resp.into_string().expect("text");
+    assert!(
+        body.contains("id=\"root\""),
+        "内嵌首页内容不对（{} 字节）",
+        body.len()
+    );
+
+    // 无扩展名的未知路径也要回退到内嵌首页（SPA）
+    let fb = ureq::get(&s.url("/some/route")).call().expect("fallback");
+    assert_eq!(fb.status(), 200);
+    assert!(fb.into_string().unwrap().contains("id=\"root\""));
+
+    // 真存在的静态资源也得能从内嵌拿到。
+    // 注意：文件名带内容 hash，***不能硬编码***——前端一重建就换了。
+    // 从首页 HTML 里把第一个 static/ 路径抠出来。
+    let js_path = body
+        .split("static/")
+        .nth(1)
+        .and_then(|tail| tail.split('"').next())
+        .map(|p| format!("/static/{p}"));
+    if let Some(path) = js_path {
+        let r = ureq::get(&s.url(&path)).call().expect("内嵌静态资源");
+        assert_eq!(r.status(), 200, "{path} 应从内嵌资源拿到");
+        assert!(r.into_string().unwrap().len() > 1000, "{path} 内容不对");
+    }
+
+    // 带扩展名且不存在 → 仍然 404（不能变成白屏）
+    let code = status(ureq::get(&s.url("/nope.js")).call());
+    assert_eq!(code, 404, "未知静态资源应 404，实际 {code}");
 }

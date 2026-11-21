@@ -261,6 +261,25 @@ pub fn peer_url(peer: &str) -> String {
     with_scheme.trim_end_matches('/').to_string()
 }
 
+/// 是否局域网内的地址（配对请求只接受这些来源）。
+///
+/// 同步端口听 `0.0.0.0`，如果这台机器直接挂在公网上，任何人都会发配对请求。
+/// 虽然最终要本机用户点「接受」才会生效，但没必要让请求随便进来。
+///
+/// `Ipv4Addr::is_private` 覆盖 10/8、172.16/12、192.168/16；
+/// `is_link_local` 是 169.254/16（自配地址）；回环也算——那是同机的另一个进程。
+pub fn is_lan_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+/// 字符串版的 [`is_lan_ip`]：解析不了就当不是（宁严勿松）。
+pub fn is_lan_ip_str(ip: &str) -> bool {
+    ip.parse::<std::net::IpAddr>().map(is_lan_ip).unwrap_or(false)
+}
+
 /// 本机在局域网里的 IPv4（不含回环）。
 ///
 /// 主要手段是 UDP connect 取出口地址：不真的发包，只让系统选默认网卡。

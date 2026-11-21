@@ -14,6 +14,7 @@
 mod aggregate;
 mod applog;
 mod archive;
+mod assets;
 mod billing;
 mod http;
 mod store;
@@ -25,6 +26,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process;
 use std::thread;
+use std::time::Duration;
 
 use tiny_http::Server;
 
@@ -32,7 +34,7 @@ use store::Store;
 
 /// 版本号。**改功能就递增**：排查时靠它确认对方装的到底是哪个构建，
 /// 不然「改了但没生效」和「根本没改」看起来一模一样。
-const VERSION: &str = "0.2.1";
+const VERSION: &str = "0.2.2";
 
 struct Args {
     port: u16,
@@ -40,6 +42,8 @@ struct Args {
     www: String,
     /// 不隐藏控制台（调试/自查用）
     console: bool,
+    /// 不自动打开浏览器（开机自启时用）
+    no_open: bool,
     /// 显式指定同步端口（优先于 config.json）
     sync_port: Option<u16>,
 }
@@ -77,6 +81,7 @@ fn parse_args() -> Args {
     let mut data = resolve_default(&exe_dir, "data", false);
     let mut www = resolve_default(&exe_dir, "www", true);
     let mut console = false;
+    let mut no_open = false;
     let mut sync_port: Option<u16> = None;
 
     // 收成 Vec 再用下标遍历：避免 `while let Some(x) = it.next()` 在循环里
@@ -113,9 +118,12 @@ fn parse_args() -> Args {
                 }
             }
             "--console" => console = true,
+            "--no-open" => no_open = true,
             "--no-window" => {}
             "-h" | "--help" => {
-                println!("用法: dsh-chat [--port 8790] [--data ./data] [--www ./www] [--console]");
+                println!(
+                    "用法: dsh-chat [--port 8790] [--data ./data] [--www ./www] [--sync-port 8791] [--console] [--no-open]"
+                );
                 process::exit(0);
             }
             _ => {}
@@ -128,6 +136,7 @@ fn parse_args() -> Args {
         data,
         www,
         console,
+        no_open,
         sync_port,
     }
 }
@@ -152,8 +161,86 @@ fn bind_sync(want: u16) -> Result<(u16, Server), String> {
     Err(last)
 }
 
+/// 探测「本机是不是已经有一个实例在跑这个端口」。
+///
+/// 用裸 TCP 发一个最小 GET，不走 ureq：
+///   - 不读系统代理（localhost 绝不能交给代理）
+///   - 超时短（250ms），端口没人听就立即返回
+/// 只认返回里同时有 `HTTP/1.` 和 `"version"` 的响应，
+/// 避免把别的服务误判成本应用。
+fn already_running(port: u16) -> bool {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+
+    let Some(addr) = ("127.0.0.1", port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+    else {
+        return false;
+    };
+    let Ok(mut sock) =
+        TcpStream::connect_timeout(&SocketAddr::from(addr), Duration::from_millis(250))
+    else {
+        return false;
+    };
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
+    let req = format!("GET /local/status HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+    if sock.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    let Ok(n) = sock.read(&mut buf) else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&buf[..n]);
+    text.contains("HTTP/1.") && text.contains("\"version\"")
+}
+
+/// 用默认浏览器打开界面。
+///
+/// 分平台：Windows 走 `cmd /c start`（不自建窗口），macOS 走 `open`，
+/// 其余按 XDG 走 `xdg-open`。失败不致命：用户可以手动打开那一行 URL，
+/// 所以只记日志、不中断启动。
+fn open_browser(url: &str) {
+    #[cfg(windows)]
+    {
+        // 复用托盘的那份实现：它带 CREATE_NO_WINDOW，不会闪一个 cmd 黑框
+        tray::open_ui_url(url);
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let program = "xdg-open";
+
+    #[cfg(not(windows))]
+    {
+        match process::Command::new(program).arg(url).spawn() {
+            Ok(_) => {}
+            Err(e) => eprintln!("打开浏览器失败（{program}）: {e}，请手动访问 {url}"),
+        }
+    }
+}
+
 fn main() {
     let args = parse_args();
+
+    // 已经有一个实例在跑：把浏览器指向它，然后正常退出。
+    //
+    // 场景：托盘常驻 + 用户又双击了一次 exe（或开机自启后手动打开）。
+    // 以前会在端口绑定处报「无法监听」并退出码 1，看起来像崩了；
+    // 而且用户什么也没得到——他要的只是界面。
+    //
+    // 放在 Store::open 之前：第二个实例不该去碰数据目录。
+    if already_running(args.port) {
+        let url = format!("http://127.0.0.1:{}/", args.port);
+        println!("已有实例在运行：{url}（本次启动退出）");
+        if !args.no_open {
+            open_browser(&url);
+        }
+        return;
+    }
 
     let store = match Store::open(&args.data, args.port) {
         Ok(s) => s,
@@ -167,7 +254,9 @@ fn main() {
     let store: &'static Store = Box::leak(Box::new(store));
 
     let www = PathBuf::from(&args.www);
+    // 界面来源：磁盘 www 优先，否则用内嵌的（单 exe 发布）
     let www_ok = www.join("index.html").is_file();
+    let ui_from_embedded = !www_ok && !assets::is_empty();
 
     let addr = format!("127.0.0.1:{}", args.port);
     let server = match Server::http(&addr) {
@@ -243,11 +332,13 @@ fn main() {
     let www_dir = www.display();
     if www_ok {
         println!("静态目录 {www_dir} (index.html 存在)");
+    } else if ui_from_embedded {
+        println!("界面 内嵌（{} 个文件），无需外部 www 目录", assets::count());
     } else {
-        println!("静态目录 {www_dir} (index.html 缺失，界面会 404)");
-        println!("  用 --www 指向含 index.html 的目录，例如：");
-        println!("    dsh-chat --www ./www");
-        applog::write(store, &format!("警告：静态目录 {www_dir} 缺 index.html"));
+        println!("静态目录 {www_dir} (index.html 缺失)");
+        println!("  用 --www 指向含 index.html 的目录，或先构建前端：");
+        println!("    pnpm build（DSH_LOCAL=1）");
+        applog::write(store, "警告：既没有 www/index.html，也没内嵌前端");
     }
 
     // 托盘图标：加上了才隐藏控制台。
@@ -260,6 +351,14 @@ fn main() {
             eprintln!("托盘图标创建失败，保留控制台窗口");
             applog::write(store, "托盘图标创建失败，保留控制台窗口");
         }
+    }
+
+    // 自动打开浏览器。
+    //
+    // 放在托盘之后：先隐藏控制台再打开页面，用户不会看到黑框一闪。
+    // `--no-open` 用于开机自启 / 调试（不想每次弹一个标签页）。
+    if !args.no_open {
+        open_browser(&format!("http://127.0.0.1:{}/", args.port));
     }
 
     // 每个请求单独一个线程。

@@ -182,10 +182,17 @@ fn remove_icon(hwnd: HWND) {
 
 /// 用默认浏览器打开界面。走 `cmd /c start`，免得再引 ShellExecuteW。
 fn open_ui(port: u16) {
+    open_ui_url(&format!("http://127.0.0.1:{port}/"));
+}
+
+/// 用默认浏览器打开指定 URL。
+///
+/// 走 `cmd /c start`：不用另引 ShellExecuteW，而且带上 CREATE_NO_WINDOW，
+/// 启动时不会闪一下 cmd 黑框。
+pub fn open_ui_url(url: &str) {
     use std::os::windows::process::CommandExt;
-    let url = format!("http://127.0.0.1:{port}/");
     let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", "", &url])
+        .args(["/C", "start", "", url])
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
 }

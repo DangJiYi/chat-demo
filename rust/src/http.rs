@@ -101,21 +101,24 @@ fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-fn content_type_of(path: &Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase()
-        .as_str()
-    {
+/// 按文件名（或路径）推 Content-Type。
+///
+/// 收 `&str` 而不是 `&Path`：内嵌资源只有名字、没有磁盘路径。
+fn mime_for(name: &str) -> &'static str {
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
         "html" => "text/html; charset=utf-8",
-        "js" => "text/javascript; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "json" => "application/json; charset=utf-8",
         "svg" => "image/svg+xml",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
         "woff2" => "font/woff2",
         "woff" => "font/woff",
         "ttf" => "font/ttf",
@@ -125,12 +128,35 @@ fn content_type_of(path: &Path) -> &'static str {
     }
 }
 
+/// `static/` 下的资源带内容 hash，可以长缓存；其余一律不缓存（要能立即看到更新）。
+fn cache_for(rel: &str) -> &'static str {
+    if rel.starts_with("static/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
+}
+
+fn send_asset(req: Request, data: Vec<u8>, rel: &str) {
+    let _ = req.respond(
+        Response::from_data(data)
+            .with_status_code(StatusCode(200))
+            .with_header(header(b"Content-Type", mime_for(rel).as_bytes()))
+            .with_header(header(b"Cache-Control", cache_for(rel).as_bytes())),
+    );
+}
+
 /// 静态文件，语义与 server.py 的 serve_static 一致：
 ///   - 目录或未知路径 → index.html（SPA fallback）
 ///   - 带扩展名却找不到 → 404
 ///   - static/ 下的资源长缓存，其余 no-cache
+///
+/// 查找顺序是「磁盘优先，内嵌兵底」：
+///   - 没放 www 目录（单 exe 发布）→ 直接走内嵌资源
+///   - 有 www 目录（开发、或用 --www 换皮）→ 改前端不用重编 exe
 fn serve_static(req: Request, www: &Path, rel: &str) {
     let rel = if rel.is_empty() { "index.html" } else { rel };
+    // 目录穿越一律拒绝（safe_join 只放行 Normal 段）
     let Some(mut full) = safe_join(www, rel) else {
         send_error(req, 403, "forbidden");
         return;
@@ -138,35 +164,48 @@ fn serve_static(req: Request, www: &Path, rel: &str) {
     if full.is_dir() {
         full = full.join("index.html");
     }
-    if !full.is_file() {
-        // 有扩展名说明是具体资源，缺了就是 404，不能兜底成 index.html
-        if Path::new(rel).extension().is_some() {
-            send_error(req, 404, "not found");
-            return;
-        }
-        full = www.join("index.html");
-        if !full.is_file() {
-            send_error(req, 500, "www/index.html 缺失");
-            return;
-        }
+    if full.is_file() {
+        return match std::fs::read(&full) {
+            // 目录情形下真正的文件名是 index.html，MIME 要按它算
+            Ok(data) => send_asset(
+                req,
+                data,
+                if full.ends_with("index.html") {
+                    "index.html"
+                } else {
+                    rel
+                },
+            ),
+            Err(e) => send_error(req, 500, &format!("读取失败: {e}")),
+        };
     }
-    let data = match std::fs::read(&full) {
-        Ok(d) => d,
-        Err(e) => {
-            send_error(req, 500, &format!("读取失败: {e}"));
-            return;
-        }
-    };
-    let cache = if rel.starts_with("static/") {
-        "public, max-age=31536000, immutable"
-    } else {
-        "no-cache"
-    };
-    let _ = req.respond(
-        Response::from_data(data)
-            .with_status_code(StatusCode(200))
-            .with_header(header(b"Content-Type", content_type_of(&full).as_bytes()))
-            .with_header(header(b"Cache-Control", cache.as_bytes())),
+
+    // 磁盘没有 → 内嵌
+    if let Some(bytes) = crate::assets::lookup(rel) {
+        return send_asset(req, bytes.to_vec(), rel);
+    }
+
+    // 有扩展名说明是具体资源，缺了就是 404，不能兜底成 index.html
+    if Path::new(rel).extension().is_some() {
+        send_error(req, 404, "not found");
+        return;
+    }
+
+    // SPA fallback：无扩展名的未知路径回退到首页（先磁盘再内嵌）
+    let disk_index = www.join("index.html");
+    if disk_index.is_file() {
+        return match std::fs::read(&disk_index) {
+            Ok(data) => send_asset(req, data, "index.html"),
+            Err(e) => send_error(req, 500, &format!("读取失败: {e}")),
+        };
+    }
+    if let Some(bytes) = crate::assets::lookup("index.html") {
+        return send_asset(req, bytes.to_vec(), "index.html");
+    }
+    send_error(
+        req,
+        500,
+        "没有可用的界面：www/index.html 缺失，且 exe 内未内嵌前端",
     );
 }
 
@@ -1446,6 +1485,12 @@ pub fn handle_sync(mut req: Request, st: &'static Store, version: &str) {
     }
 
     // 配对请求：只入待确认队列，**不直接改配置**。
+    //
+    // 为什么不自动接受：这个端口无鉴权，静默接受等于让局域网内任何人
+    // 把你的 peer 改成他自己的服务器（同步数据就流向别人了）。
+    // 所以保留「本机点接受」这一步，但把它做得真的方便：
+    //   - ip 用 **TCP 源地址**（`remote_addr`），不信请求体里那个自报的
+    //   - 本机面板每 4 秒拉一次队列，面板开着就能看到，不用重开
     if (path == "/peer" || path == "/local/peer") && method == Method::Post {
         let body = match read_body(&mut req) {
             Ok(b) => b,
@@ -1455,17 +1500,35 @@ pub fn handle_sync(mut req: Request, st: &'static Store, version: &str) {
             }
         };
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
-        let ip = v
+
+        // 请求体里的 ip 是发起方自己猜的（多网卡 / 开 VPN 时经常猜错），
+        // 拿它当配置会得到一个永远连不上的地址。源地址是内核给的，更可靠。
+        let observed_ip = req.remote_addr().map(|a| a.ip().to_string());
+        let reported_ip = v
             .get("ip")
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .trim()
             .to_string();
+        let ip = match observed_ip {
+            Some(o) if !o.is_empty() => o,
+            _ => reported_ip.clone(),
+        };
         if ip.is_empty() {
             send_error(req, 400, "缺少 ip");
             return;
         }
-        let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(8791) as u16;
+        if !crate::sync::is_lan_ip_str(&ip) {
+            applog::write(st, &format!("拒绝非局域网配对请求：{ip}"));
+            send_error(req, 403, "只接受局域网内的配对");
+            return;
+        }
+
+        let port = v
+            .get("port")
+            .and_then(|x| x.as_u64())
+            .filter(|p| (1024..=65535).contains(p))
+            .unwrap_or(8791) as u16;
         let name: String = v
             .get("name")
             .and_then(|x| x.as_str())
@@ -1473,6 +1536,15 @@ pub fn handle_sync(mut req: Request, st: &'static Store, version: &str) {
             .chars()
             .take(64)
             .collect();
+        if let Some(o) = &observed_ip {
+            if !reported_ip.is_empty() && reported_ip != *o {
+                applog::write(
+                    st,
+                    &format!("配对请求：对端自报 {reported_ip}，实际来自 {o}，按实际地址配对"),
+                );
+            }
+        }
+        applog::write(st, &format!("收到配对请求：{name} ({ip}:{port})"));
         st.add_pair_request(crate::sync::PairRequest {
             ip,
             port,

@@ -111,6 +111,9 @@ fn try_start(tag: &str, attempt: u32) -> Option<Node> {
         .arg(dir.join("data"))
         .arg("--www")
         .arg(dir.join("www"))
+        // 无界面运行：不弹浏览器、不建托盘
+        .arg("--no-open")
+        .arg("--console")
         .stdout(std::process::Stdio::from(out))
         .stderr(std::process::Stdio::from(err))
         .spawn()
