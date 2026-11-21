@@ -355,16 +355,16 @@ impl Store {
             Ok(raw) => serde_json::from_slice(&raw).unwrap_or_default(),
             Err(_) => serde_json::Map::new(),
         };
-        cfg.entry("peer".into()).or_insert(serde_json::json!(""));
-        cfg.entry("intervalSec".into())
-            .or_insert(serde_json::json!(3));
-        cfg.entry("archiveDays".into())
-            .or_insert(serde_json::json!(7));
-        cfg.entry("imageDays".into())
-            .or_insert(serde_json::json!(14));
-        cfg.entry("deviceName".into())
+        // entry() 收 S: Into<String>，直接传 &str 即可。
+        // 不要写 "peer".into()——那是在 S 尚未确定时又套一层 Into，
+        // 编译器无法推断 S 的具体类型（E0283）。
+        cfg.entry("peer").or_insert(serde_json::json!(""));
+        cfg.entry("intervalSec").or_insert(serde_json::json!(3));
+        cfg.entry("archiveDays").or_insert(serde_json::json!(7));
+        cfg.entry("imageDays").or_insert(serde_json::json!(14));
+        cfg.entry("deviceName")
             .or_insert(serde_json::json!(hostname()));
-        cfg.entry("syncPort".into())
+        cfg.entry("syncPort")
             .or_insert(serde_json::json!(self.port as i64 + 1));
 
         // 校验：非法值回落到默认，避免界面里存了脏数据后行为诡异
