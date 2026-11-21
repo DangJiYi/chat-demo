@@ -794,6 +794,6 @@ fn proxy_paths_are_routed_not_404() {
     assert_eq!(code, 400, "POST /anthropic/v1/messages 应进代理（400），实际 {code}");
 
     // 反过来：真的未知路径不能被误当代理（仍走 SPA 回退）
-    let code = status(ureq::get(&s.url("/modelsx")));
+    let code = status(ureq::get(&s.url("/modelsx")).call());
     assert_eq!(code, 200, "/modelsx 不是代理路径，应走 SPA 回退，实际 {code}");
 }

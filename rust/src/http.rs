@@ -201,13 +201,14 @@ pub fn handle(mut req: Request, st: &'static Store, www: &Path, version: &str) {
     // “这条会话不存在”），于是 404 的错误体被当成数组去 .map()，界面报的是
     // “对话列表加载失败”——排查时完全看不出根因在路由前缀上。
     //
-    // 用 starts_with + 切片而不是 strip_prefix：后者返回的 Option<&str> 会在整个
-    // match 期间持有 raw_path 的借用，导致另一分支无法 move raw_path（E0505）。
+    // 用 strip_prefix 而不是 starts_with + 切片：后者会被 clippy 判为
+    // manual_strip。两个分支都不会 move raw_path（是 clone），无借用冲突。
+    //
+    // 注意要检查边界：`/local/dbfoo` 不该被改写成 `/dbfoo`。
     const DB_PREFIX: &str = "/local/db";
-    let path = if raw_path.starts_with(DB_PREFIX) {
-        format!("/db{}", &raw_path[DB_PREFIX.len()..])
-    } else {
-        raw_path.clone()
+    let path = match raw_path.strip_prefix(DB_PREFIX) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("/db{rest}"),
+        _ => raw_path.clone(),
     };
 
     // ---------- /local/status ----------

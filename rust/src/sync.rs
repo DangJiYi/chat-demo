@@ -25,7 +25,10 @@ const DISCOVER_MAGIC: &[u8] = b"DSH-CHAT-DISCOVER/1";
 const DISCOVER_REPLY: &[u8] = b"DSH-CHAT-HERE/1";
 
 /// 同步运行状态，供 /local/sync/status 展示。
-#[derive(Debug, Clone, Serialize)]
+///
+/// 字段都是 Default 类型（bool / String / i64），所以直接 derive：
+/// 手写 impl 只会多一份需要同步维护的代码。
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SyncState {
     pub enabled: bool,
     pub peer: String,
@@ -37,20 +40,6 @@ pub struct SyncState {
     pub last_err: String,
     pub pulled: i64,
     pub cursor: i64,
-}
-
-impl Default for SyncState {
-    fn default() -> Self {
-        SyncState {
-            enabled: false,
-            peer: String::new(),
-            last_ok: 0,
-            last_try: 0,
-            last_err: String::new(),
-            pulled: 0,
-            cursor: 0,
-        }
-    }
 }
 
 /// 待确认的配对请求（像蓝牙那样：对方请求，本机点接受才生效）。
