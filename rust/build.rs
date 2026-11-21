@@ -30,6 +30,14 @@ fn main() {
     // 排序让输出稳定：同一份源码每次生成的二进制字节一致，便于比对
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
+    // 让 cargo 在这些文件变动时重跑：
+    //   - 目录：新增/删除文件要重新生成清单（rustc 的 dep-info 只跟踪
+    //     已 include 的文件，新文件不在里面）
+    //   - 每个文件：确保内容变动也触发（双保险，代价只是一行 cargo 指令）
+    for (_, abs) in &files {
+        println!("cargo:rerun-if-changed={}", abs.display());
+    }
+
     let mut src = String::new();
     src.push_str("// 由 build.rs 生成，请勿手改。\n");
     src.push_str("pub static EMBEDDED_WWW: &[(&str, &[u8])] = &[\n");

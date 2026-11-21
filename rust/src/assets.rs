@@ -16,10 +16,9 @@ include!(concat!(env!("OUT_DIR"), "/embedded_www.rs"));
 pub fn lookup(rel: &str) -> Option<&'static [u8]> {
     let want = rel.trim_start_matches('/');
     // 文件数一百出头，线性扫足够快（只在磁盘也没命中时才走到这里）。
-    EMBEDDED_WWW
-        .iter()
-        .find(|(name, _)| *name == want)
-        .map(|(_, bytes)| *bytes)
+    // 写 `e.0` / `e.1` 而不是模式解构：后者在 `&&(&str, &[u8])` 上依赖
+    // match ergonomics 的多层自动解引用，读起来容易歧义。
+    EMBEDDED_WWW.iter().find(|e| e.0 == want).map(|e| e.1)
 }
 
 /// 内嵌资源是否为空（前端没构建过）。

@@ -170,8 +170,9 @@ fn bind_sync(want: u16) -> Result<(u16, Server), String> {
 /// 避免把别的服务误判成本应用。
 fn already_running(port: u16) -> bool {
     use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+    use std::net::{TcpStream, ToSocketAddrs};
 
+    // `to_socket_addrs` 的迭代项已经是 SocketAddr，不需要再包一层 From
     let Some(addr) = ("127.0.0.1", port)
         .to_socket_addrs()
         .ok()
@@ -179,9 +180,7 @@ fn already_running(port: u16) -> bool {
     else {
         return false;
     };
-    let Ok(mut sock) =
-        TcpStream::connect_timeout(&SocketAddr::from(addr), Duration::from_millis(250))
-    else {
+    let Ok(mut sock) = TcpStream::connect_timeout(&addr, Duration::from_millis(250)) else {
         return false;
     };
     let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));

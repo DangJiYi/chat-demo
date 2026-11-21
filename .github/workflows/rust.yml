@@ -252,13 +252,17 @@ jobs:
             Pop-Location
           }
 
-      # 产物必须带上 www：只有 exe 的话，下载后必然“index.html 缺失、界面 404”。
+      # 产物就是**一个 exe**：前端已由 build.rs 内嵌（见 rust/build.rs）。
+      #
+      # 不再附带 www/：那份 3.8 MB 的文件已经编进 exe 了，再发一份只是重复。
+      # 上面的 `serves_embedded_ui_without_www_dir` 用例保证了“没 www 也能出界面”，
+      # 否则这一步会把一个白屏 exe 发出去。
       - name: Package
         run: |
           New-Item -ItemType Directory -Force -Path dist-pkg | Out-Null
           Copy-Item rust/target/release/dsh-chat.exe dist-pkg/
-          Copy-Item -Recurse www dist-pkg/www
           Compress-Archive -Path dist-pkg/* -DestinationPath dsh-chat-rust-win.zip -Force
+          Write-Host ("exe 大小: {0:N2} MB" -f ((Get-Item rust/target/release/dsh-chat.exe).Length / 1MB))
           Write-Host ("zip 大小: {0:N2} MB" -f ((Get-Item dsh-chat-rust-win.zip).Length / 1MB))
 
       - uses: actions/upload-artifact@v5

@@ -9,6 +9,7 @@ use serde::Serialize;
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 
 use crate::aggregate;
+use crate::applog;
 use crate::store::Store;
 
 /// 请求体上限，与 Python 版 MAX_SESSION 一致。
@@ -151,7 +152,7 @@ fn send_asset(req: Request, data: Vec<u8>, rel: &str) {
 ///   - 带扩展名却找不到 → 404
 ///   - static/ 下的资源长缓存，其余 no-cache
 ///
-/// 查找顺序是「磁盘优先，内嵌兵底」：
+/// 查找顺序是「磁盘优先，内嵌兜底」：
 ///   - 没放 www 目录（单 exe 发布）→ 直接走内嵌资源
 ///   - 有 www 目录（开发、或用 --www 换皮）→ 改前端不用重编 exe
 fn serve_static(req: Request, www: &Path, rel: &str) {
