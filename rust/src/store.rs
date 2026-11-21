@@ -13,9 +13,36 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// 单个会话文件的大小上限，与 Python 版一致（32 MB）。
 const MAX_SESSION: u64 = 32 << 20;
+/// 单个附件上限，与 Python 版 MAX_FILE 一致（128 MB）。
+const MAX_FILE: u64 = 128 << 20;
+
+/// 附件元数据，字段名与 Python 版 index.json 里的 files[fid] 一致。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMeta {
+    pub id: String,
+    pub sha: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(rename = "mime", default)]
+    pub mime: String,
+    #[serde(rename = "isImage", default)]
+    pub is_image: bool,
+    #[serde(rename = "createdAt", default)]
+    pub created_at: i64,
+}
+
+/// 内容寻址：hex(sha256(data))。与 Python 版 hashlib.sha256().hexdigest() 一致。
+pub fn sha256_hex(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    format!("{:x}", h.finalize())
+}
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -136,7 +163,6 @@ pub struct Store {
     port: u16,
     started: Instant,
 }
-
 impl Store {
     /// 建好目录结构。已存在则什么也不做（与 Python 版一致）。
     pub fn open(data_dir: &str, port: u16) -> io::Result<Self> {
@@ -287,6 +313,307 @@ impl Store {
     /// 各子目录占用，给 /local/storage 用。
     pub fn subdir_bytes(&self, name: &str) -> u64 {
         dir_size(&self.dir.join(name))
+    }
+
+    // ---------------------------------------------------------------- 附件
+
+    /// 读文件索引（data/meta/index.json 里的 files 字段）。
+    ///
+    /// 刻意与 Python 共用同一份 index.json：Rust 只改 files 键、保留其余，
+    /// 这样两个版本能读同一个 data/ 目录，迁移期间可以对照。
+    fn files_index_path(&self) -> PathBuf {
+        self.dir.join("meta").join("index.json")
+    }
+
+    fn load_files_index(&self) -> serde_json::Map<String, serde_json::Value> {
+        let raw = match fs::read(self.files_index_path()) {
+            Ok(r) => r,
+            Err(_) => return serde_json::Map::new(),
+        };
+        let doc: serde_json::Value = match serde_json::from_slice(&raw) {
+            Ok(d) => d,
+            Err(_) => return serde_json::Map::new(),
+        };
+        doc.get("files")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 只覆盖 index.json 的 files 键，保留 sessions / archive 等。
+    fn save_files_index(
+        &self,
+        files: &serde_json::Map<String, serde_json::Value>,
+    ) -> io::Result<()> {
+        let path = self.files_index_path();
+        let mut doc: serde_json::Value = match fs::read(&path) {
+            Ok(raw) => serde_json::from_slice(&raw).unwrap_or_else(|_| serde_json::json!({})),
+            Err(_) => serde_json::json!({}),
+        };
+        if !doc.is_object() {
+            doc = serde_json::json!({});
+        }
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert("files".into(), serde_json::Value::Object(files.clone()));
+        }
+        let out = serde_json::to_vec_pretty(&doc).map_err(io::Error::other)?;
+        atomic_write(&path, &out)
+    }
+
+    /// 存附件：按内容寻址写 media/<sha256>，再记录 id → 元数据。
+    pub fn put_file(
+        &self,
+        fid: &str,
+        data: &[u8],
+        mime: &str,
+        name: &str,
+        image: bool,
+    ) -> Result<FileMeta, String> {
+        if data.len() as u64 > MAX_FILE {
+            return Err("附件过大".into());
+        }
+        let digest = sha256_hex(data);
+        atomic_write(&self.dir.join("media").join(&digest), data)
+            .map_err(|e| format!("写入失败: {e}"))?;
+        let meta = FileMeta {
+            id: fid.to_string(),
+            sha: digest,
+            name: name.to_string(),
+            size: data.len() as u64,
+            mime: mime.to_string(),
+            is_image: image,
+            created_at: now_ms(),
+        };
+        let mut files = self.load_files_index();
+        files.insert(
+            fid.to_string(),
+            serde_json::to_value(&meta).map_err(|e| e.to_string())?,
+        );
+        self.save_files_index(&files).map_err(|e| e.to_string())?;
+        Ok(meta)
+    }
+
+    /// 读附件：返回 (元数据, 字节)。
+    pub fn get_file(&self, fid: &str) -> Result<Option<(FileMeta, Vec<u8>)>, String> {
+        let files = self.load_files_index();
+        let Some(raw) = files.get(fid) else {
+            return Ok(None);
+        };
+        let meta: FileMeta =
+            serde_json::from_value(raw.clone()).map_err(|e| format!("附件元数据损坏: {e}"))?;
+        match fs::read(self.dir.join("media").join(&meta.sha)) {
+            Ok(data) => Ok(Some((meta, data))),
+            // 元数据在但原件不在：报 404（与 Python 版返回 (fm, None) 的语义一致）
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("读取失败: {e}")),
+        }
+    }
+
+    // ---------------------------------------------------------------- 导入暂存
+
+    fn staged_sessions_dir(&self) -> PathBuf {
+        self.dir.join("staged").join("sessions")
+    }
+
+    fn staged_files_dir(&self) -> PathBuf {
+        self.dir.join("staged").join("files")
+    }
+
+    fn staged_files_meta_path(&self) -> PathBuf {
+        self.dir.join("staged").join("files.json")
+    }
+
+    /// 清空暂存。导入开始前清残留，导入失败后清本次写入。
+    pub fn clear_staging(&self) -> Result<(), String> {
+        for dir in [self.staged_sessions_dir(), self.staged_files_dir()] {
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+        let _ = fs::remove_file(self.staged_files_meta_path());
+        Ok(())
+    }
+
+    /// 暂存一条会话。不校验 id 与文件名是否一致：导入的数据可能不规范，
+    /// 真正的校验留到 commit 时做。
+    pub fn add_staging_session(&self, sid: &str, raw: &[u8]) -> Result<(), String> {
+        atomic_write(&self.staged_sessions_dir().join(format!("{sid}.json")), raw)
+            .map_err(|e| format!("写入暂存失败: {e}"))
+    }
+
+    /// 暂存一个附件原件。
+    pub fn add_staging_file(
+        &self,
+        fid: &str,
+        data: &[u8],
+        mime: &str,
+        image: bool,
+    ) -> Result<(), String> {
+        if data.len() as u64 > MAX_FILE {
+            return Err("附件过大".into());
+        }
+        atomic_write(&self.staged_files_dir().join(fid), data)
+            .map_err(|e| format!("写入暂存失败: {e}"))?;
+        let mut metas: serde_json::Map<String, serde_json::Value> =
+            match fs::read(self.staged_files_meta_path()) {
+                Ok(raw) => serde_json::from_slice(&raw).unwrap_or_default(),
+                Err(_) => serde_json::Map::new(),
+            };
+        // 保留 MIME 与图片标记：导入的图片后续要能被“压缩图片”识别
+        metas.insert(
+            fid.to_string(),
+            serde_json::json!({ "id": fid, "size": data.len(), "mime": mime, "isImage": image }),
+        );
+        let out =
+            serde_json::to_vec(&serde_json::Value::Object(metas)).map_err(|e| e.to_string())?;
+        atomic_write(&self.staged_files_meta_path(), &out).map_err(|e| format!("写入失败: {e}"))
+    }
+
+    /// 回填暂存会话里的附件 MIME（图片字节在会话 JSON 之后才读到）。
+    pub fn update_staging_types(
+        &self,
+        types: &std::collections::HashMap<String, String>,
+    ) -> Result<(), String> {
+        let entries = match fs::read_dir(self.staged_sessions_dir()) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = match fs::read(&path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let mut doc: serde_json::Value = match serde_json::from_slice(&raw) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let mut changed = false;
+            if let Some(msgs) = doc.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                for msg in msgs.iter_mut() {
+                    if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+                        continue;
+                    }
+                    if let Some(files) = msg.get_mut("files").and_then(|f| f.as_array_mut()) {
+                        for f in files.iter_mut() {
+                            let Some(fid) = f.get("id").and_then(|v| v.as_str()) else {
+                                continue;
+                            };
+                            if let Some(want) = types.get(fid) {
+                                if f.get("mimeType").and_then(|v| v.as_str()) != Some(want) {
+                                    f["mimeType"] = serde_json::Value::String(want.clone());
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if changed {
+                let out = serde_json::to_vec(&doc).map_err(|e| e.to_string())?;
+                atomic_write(&path, &out).map_err(|e| format!("写入失败: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 用暂存替换正式数据，返回被提交的会话摘要列表。
+    ///
+    /// 与 Python 版的差别（刻意的）：Python 先删光 sessions 再写，中途失败数据就没了。
+    /// 这里先把暂存会话全部写入 sessions，最后才删「不属于新集合」的旧文件。
+    /// 要么新数据已完整落盘，要么旧数据还在，不会出现半截状态。
+    pub fn commit_staging(&self) -> Result<Vec<SessionSummary>, String> {
+        let mut accepted = Vec::new();
+        let mut keep: HashSet<String> = HashSet::new();
+
+        let entries = match fs::read_dir(self.staged_sessions_dir()) {
+            Ok(e) => e,
+            Err(_) => return Ok(accepted), // 没有暂存：什么都不做
+        };
+        // 排序保证结果稳定（与 Python 版 sorted(os.listdir()) 一致）
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+
+        for path in paths {
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = match fs::read(&path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let Some(parsed) = parse_session(&raw) else {
+                continue; // 解析不了就跳过，不把坏数据写进正式库
+            };
+            let sid = parsed.summary.id.clone();
+            atomic_write(&self.session_path(&sid), &raw).map_err(|e| format!("写入失败: {e}"))?;
+            keep.insert(sid);
+            accepted.push(parsed.summary);
+        }
+
+        // 附件：从暂存搬到 media，按内容寻址记录
+        let mut files: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        if let Ok(raw) = fs::read(self.staged_files_meta_path()) {
+            if let Ok(serde_json::Value::Object(metas)) = serde_json::from_slice(&raw) {
+                for (fid, meta) in metas {
+                    let data = match fs::read(self.staged_files_dir().join(&fid)) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+                    let digest = sha256_hex(&data);
+                    atomic_write(&self.dir.join("media").join(&digest), &data)
+                        .map_err(|e| format!("写入失败: {e}"))?;
+                    let mime = meta
+                        .get("mime")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("application/octet-stream")
+                        .to_string();
+                    let is_image = meta
+                        .get("isImage")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or_else(|| mime.starts_with("image/"));
+                    let record = FileMeta {
+                        id: fid.clone(),
+                        sha: digest,
+                        name: meta
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        size: data.len() as u64,
+                        mime,
+                        is_image,
+                        created_at: now_ms(),
+                    };
+                    files.insert(
+                        fid,
+                        serde_json::to_value(&record).map_err(|e| e.to_string())?,
+                    );
+                }
+            }
+        }
+
+        // 新数据全部落盘之后，才删旧会话文件
+        if let Ok(entries) = fs::read_dir(self.dir.join("sessions")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if !keep.contains(stem) {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+
+        self.save_files_index(&files).map_err(|e| e.to_string())?;
+        self.clear_staging()?;
+        Ok(accepted)
     }
 }
 

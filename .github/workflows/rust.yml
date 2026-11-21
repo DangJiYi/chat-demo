@@ -147,6 +147,57 @@ jobs:
             $raw2 = (Invoke-WebRequest -Uri "http://127.0.0.1:8799/db/summaries" -TimeoutSec 5).Content
             if ($raw2 -match '"s3"') { throw "墓碑会话不应出现在 /db/summaries" }
 
+            # ---------- 附件（内容寻址）----------
+            $ab = [System.Text.Encoding]::UTF8.GetBytes('hello-attachment')
+            $pf = Invoke-WebRequest -Uri 'http://127.0.0.1:8799/db/file/att1' -Method Put -Body $ab -ContentType 'text/plain' -Headers @{ 'X-File-Name' = 'note.txt' } -SkipHttpErrorCheck -TimeoutSec 5
+            if ($pf.StatusCode -ne 204) { throw "PUT /db/file 应返回 204，实际 $($pf.StatusCode)" }
+
+            $gf = Invoke-WebRequest -Uri 'http://127.0.0.1:8799/db/file/att1' -TimeoutSec 5
+            if ($gf.StatusCode -ne 200) { throw "GET /db/file 应返回 200，实际 $($gf.StatusCode)" }
+            if ($gf.Content -ne 'hello-attachment') { throw "附件内容不一致: $($gf.Content)" }
+            if ($gf.Headers['Content-Type'] -notmatch 'text/plain') { throw "附件 Content-Type 丢失: $($gf.Headers['Content-Type'])" }
+
+            # 内容寻址：media/ 下应出现 sha256 命名的原件
+            $ms = [System.IO.MemoryStream]::new($ab)
+            $sha = (Get-FileHash -Algorithm SHA256 -InputStream $ms).Hash.ToLower()
+            if (-not (Test-Path "data\media\$sha")) { throw "未按 sha256 落盘: media/$sha" }
+
+            # index.json 的 files 结构要与 Python 版兼容
+            $idx = Get-Content 'data\meta\index.json' -Raw | ConvertFrom-Json
+            if ($null -eq $idx.files.att1) { throw 'index.json 缺少 files.att1' }
+            if ($idx.files.att1.sha -ne $sha) { throw "index.json 里 sha 不对: $($idx.files.att1.sha)" }
+
+            $nf = Invoke-WebRequest -Uri 'http://127.0.0.1:8799/db/file/nope' -SkipHttpErrorCheck -TimeoutSec 5
+            if ($nf.StatusCode -ne 404) { throw "不存在的附件应 404，实际 $($nf.StatusCode)" }
+
+            # ---------- 导入暂存 ----------
+            $sc = Invoke-WebRequest -Uri 'http://127.0.0.1:8799/db/staging/clear' -Method Post -SkipHttpErrorCheck -TimeoutSec 5
+            if ($sc.StatusCode -ne 204) { throw "staging/clear 应 204，实际 $($sc.StatusCode)" }
+
+            $stg = '{"id":"imp1","title":"导入的","createdAt":7000,"updatedAt":7000,"messages":[{"id":"m1","role":"user","content":"hi","files":[{"id":"sf1","mimeType":"image/png"}]}]}'
+            $sb = [System.Text.Encoding]::UTF8.GetBytes($stg)
+            $ss = Invoke-WebRequest -Uri 'http://127.0.0.1:8799/db/staging/session/imp1' -Method Put -Body $sb -ContentType 'application/json' -SkipHttpErrorCheck -TimeoutSec 5
+            if ($ss.StatusCode -ne 204) { throw "staging/session 应 204，实际 $($ss.StatusCode)" }
+
+            $sfb = [System.Text.Encoding]::UTF8.GetBytes('staged-file')
+            $sf = Invoke-WebRequest -Uri 'http://127.0.0.1:8799/db/staging/file/sf1' -Method Put -Body $sfb -ContentType 'image/png' -SkipHttpErrorCheck -TimeoutSec 5
+            if ($sf.StatusCode -ne 204) { throw "staging/file 应 204，实际 $($sf.StatusCode)" }
+
+            $cm = Invoke-WebRequest -Uri 'http://127.0.0.1:8799/db/staging/commit' -Method Post -SkipHttpErrorCheck -TimeoutSec 5
+            if ($cm.StatusCode -ne 200) { throw "staging/commit 应 200，实际 $($cm.StatusCode)" }
+            $cmList = @($cm.Content | ConvertFrom-Json)
+            if ($cmList.Count -ne 1) { throw "commit 应返回 1 条，实际 $($cmList.Count)" }
+            if ($cmList[0].id -ne 'imp1') { throw "commit 返回的 id 不对: $($cmList[0].id)" }
+
+            # commit 后：新会话到位、旧会话被替换、暂存被清空
+            if (-not (Test-Path 'data\sessions\imp1.json')) { throw '导入的会话未落盘' }
+            if (Test-Path 'data\sessions\s1.json') { throw 'commit 应替换旧会话，s1 不该还在' }
+            $left = (Get-ChildItem 'data\staged\sessions' -ErrorAction SilentlyContinue).Count
+            if ($left -ne 0) { throw "暂存会话未清空，剩 $left" }
+
+            $g2 = Invoke-WebRequest -Uri 'http://127.0.0.1:8799/db/file/sf1' -TimeoutSec 5
+            if ($g2.Content -ne 'staged-file') { throw "导入的附件读不回来: $($g2.Content)" }
+
             Write-Host '自检通过'
           } finally {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue

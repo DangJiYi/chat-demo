@@ -78,20 +78,32 @@ spec 里是 `console=False`，所以 exe 不再弹控制台，而是常驻**系�
 **进度：静态文件 + 会话读写已实现。**
 
 ```text
-GET  /                      静态文件（含 SPA fallback 与目录穿越防护）
-GET  /static/*              长缓存资源
-GET  /local/status          服务状态
-GET  /local/storage         存储占用
-GET  /health                存活检查
-GET  /db/summaries          会话摘要（扫目录，按 updatedAt 倒序）
-GET  /db/session/<id>       读会话原文
-PUT  /db/session/<id>       存会话（校验 id 一致）
-POST /db/session/<id>/rename  改标题
-DELETE /db/session/<id>     删会话（写墓碑，不删文件）
+GET    /                        静态文件（含 SPA fallback 与目录穿越防护）
+GET    /static/*                长缓存资源
+GET    /local/status            服务状态
+GET    /local/storage           存储占用
+GET    /health                  存活检查
+GET    /db/summaries            会话摘要（扫目录，按 updatedAt 倒序）
+GET    /db/session/<id>         读会话原文
+PUT    /db/session/<id>         存会话（校验 id 一致）
+POST   /db/session/<id>/rename  改标题
+DELETE /db/session/<id>         删会话（写墓碑，不删文件）
+GET    /db/file/<id>            读附件（内容寻址，长缓存）
+PUT    /db/file/<id>            存附件
+POST   /db/staging/clear        清空导入暂存
+PUT    /db/staging/session/<id> 暂存会话
+PUT    /db/staging/file/<id>    暂存附件
+POST   /db/staging/filetypes    回填附件 MIME
+POST   /db/staging/commit       暂存 → 正式
 ```
 
-**还差的**：`/db/file/*` 与 `/db/staging/*`、`/local/*` 剩余端点、
+**还差的**：`/local/*` 剩余 11 个端点（config / apikey / usage / balance /
+search / archived / delete / restore / sync 系列 / discover / pair）、
 同步端口 8791、UDP 发现 8792、安卓壳。
+
+`commit_staging` 与 Python 版有一处刻意的差别：Python 先删光 `sessions/` 再写，
+中途失败数据就没了；Rust 先把暂存会话全部写入，最后才删「不属于新集合」的旧文件。
+要么新数据完整落盘，要么旧数据还在。
 
 其余端点按 `server.py` 逐个移植。**协议必须一致**——前端的
 `src/local/api.ts` 与 `src/services/chat/db.ts` 不改一行。

@@ -350,6 +350,163 @@ pub fn handle(mut req: Request, st: &Store, www: &Path, version: &str) {
         return;
     }
 
+    // ---------- /db/file/<id> ----------
+    if let Some(raw_id) = path.strip_prefix("/db/file/") {
+        if raw_id.is_empty() {
+            send_error(req, 404, "not found");
+            return;
+        }
+        let id = urldecode(raw_id);
+        match method {
+            Method::Put => {
+                let mime = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Content-Type"))
+                    .map(|h| h.value.as_str().to_string())
+                    .unwrap_or_else(|| "application/octet-stream".into());
+                let image = req
+                    .headers()
+                    .iter()
+                    .any(|h| h.field.equiv("X-Image") && h.value.as_str() == "1")
+                    || mime.starts_with("image/");
+                let name = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("X-File-Name"))
+                    .map(|h| urldecode(h.value.as_str()))
+                    .unwrap_or_default();
+                let body = match read_body(&mut req) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        send_error(req, 400, &e);
+                        return;
+                    }
+                };
+                match st.put_file(&id, &body, &mime, &name, image) {
+                    Ok(_) => send_no_content(req),
+                    Err(e) => send_error(req, 500, &e),
+                }
+            }
+            Method::Get => match st.get_file(&id) {
+                Ok(Some((meta, data))) => {
+                    let cache = if meta.sha.is_empty() {
+                        "no-cache"
+                    } else {
+                        // 内容寻址：同一个 id 指向的内容不变，可以长缓存
+                        "public, max-age=31536000, immutable"
+                    };
+                    let ctype = if meta.mime.is_empty() {
+                        "application/octet-stream"
+                    } else {
+                        meta.mime.as_str()
+                    };
+                    let _ = req.respond(
+                        Response::from_data(data)
+                            .with_status_code(StatusCode(200))
+                            .with_header(header(b"Content-Type", ctype.as_bytes()))
+                            .with_header(header(b"Cache-Control", cache.as_bytes())),
+                    );
+                }
+                Ok(None) => send_error(req, 404, "not found"),
+                Err(e) => send_error(req, 500, &e),
+            },
+            _ => send_error(req, 404, "not found"),
+        }
+        return;
+    }
+
+    // ---------- /db/staging/* ----------
+    if path == "/db/staging/clear" && method == Method::Post {
+        match st.clear_staging() {
+            Ok(()) => send_no_content(req),
+            Err(e) => send_error(req, 500, &e),
+        }
+        return;
+    }
+
+    if let Some(raw_id) = path.strip_prefix("/db/staging/session/") {
+        if method != Method::Put || raw_id.is_empty() {
+            send_error(req, 404, "not found");
+            return;
+        }
+        let id = urldecode(raw_id);
+        let body = match read_body(&mut req) {
+            Ok(b) => b,
+            Err(e) => {
+                send_error(req, 400, &e);
+                return;
+            }
+        };
+        match st.add_staging_session(&id, &body) {
+            Ok(()) => send_no_content(req),
+            Err(e) => send_error(req, 500, &e),
+        }
+        return;
+    }
+
+    if let Some(raw_id) = path.strip_prefix("/db/staging/file/") {
+        if method != Method::Put || raw_id.is_empty() {
+            send_error(req, 404, "not found");
+            return;
+        }
+        let id = urldecode(raw_id);
+        let mime = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Content-Type"))
+            .map(|h| h.value.as_str().to_string())
+            .unwrap_or_else(|| "application/octet-stream".into());
+        let image = req
+            .headers()
+            .iter()
+            .any(|h| h.field.equiv("X-Image") && h.value.as_str() == "1")
+            || mime.starts_with("image/");
+        let body = match read_body(&mut req) {
+            Ok(b) => b,
+            Err(e) => {
+                send_error(req, 400, &e);
+                return;
+            }
+        };
+        match st.add_staging_file(&id, &body, &mime, image) {
+            Ok(()) => send_no_content(req),
+            Err(e) => send_error(req, 500, &e),
+        }
+        return;
+    }
+
+    if path == "/db/staging/filetypes" && method == Method::Post {
+        let body = match read_body(&mut req) {
+            Ok(b) => b,
+            Err(e) => {
+                send_error(req, 400, &e);
+                return;
+            }
+        };
+        #[derive(serde::Deserialize)]
+        struct TypesBody {
+            #[serde(default)]
+            types: std::collections::HashMap<String, String>,
+        }
+        let types = serde_json::from_slice::<TypesBody>(&body)
+            .map(|b| b.types)
+            .unwrap_or_default();
+        match st.update_staging_types(&types) {
+            Ok(()) => send_no_content(req),
+            Err(e) => send_error(req, 500, &e),
+        }
+        return;
+    }
+
+    if path == "/db/staging/commit" && method == Method::Post {
+        match st.commit_staging() {
+            Ok(list) => send_json(req, 200, &list),
+            Err(e) => send_error(req, 500, &e),
+        }
+        return;
+    }
+
     // ---------- 其余交给静态文件 ----------
     if method == Method::Get {
         serve_static(req, www, path.trim_start_matches('/'));
