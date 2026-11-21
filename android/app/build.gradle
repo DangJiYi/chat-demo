@@ -17,13 +17,16 @@ android {
         applicationId 'com.dangjiyi.dshchat'
         minSdk 24
         targetSdk 34
-        versionCode 17
+        versionCode 18
         // CI 里用 -PversionName=v0.2.0 注入；本地构建用默认值
         versionName (project.findProperty('versionName') ?: '0.2.0')
 
-        // 只出手机常见的两种 ABI，APK 能小一半
+        // 只出 arm64-v8a：Chaquopy 的 libpython 每个 ABI 各一份，
+        // 带上 armeabi-v7a 等于把 native 部分翻倍。
+        // 2020 年后的安卓手机基本都是 arm64；要兼容 32 位老机器就改回
+        // abiFilters 'arm64-v8a', 'armeabi-v7a'
         ndk {
-            abiFilters 'arm64-v8a', 'armeabi-v7a'
+            abiFilters 'arm64-v8a'
         }
     }
 
@@ -37,11 +40,18 @@ android {
 
     buildTypes {
         debug {
-            // 个人自用，debug 签名足够
+            // 不压缩、带调试符号，体积明显偏大；出包请用 release
         }
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    packagingOptions {
+        // .so 在 APK 里保持压缩（默认行为，显式写出避免以后被改）
+        jniLibs {
+            useLegacyPackaging true
         }
     }
 

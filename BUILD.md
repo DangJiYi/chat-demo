@@ -146,6 +146,31 @@ cp server/server.py android/app/src/main/python/server.py
 `server/tray.py` 不需要同步——它只在 Windows 上用。Android 上 `start_tray()`
 在 `sys.platform != "win32"` 时直接返回 `None`，不会去 import 它。
 
+### APK 体积
+
+当前配置能减的都减了：
+
+- **只出 `arm64-v8a`**（`android/app/build.gradle` 的 `abiFilters`）。
+  Chaquopy 的 `libpython` 每个 ABI 一份，带 `armeabi-v7a` 等于 native 部分翻倍。
+  2020 年后的安卓机都是 arm64；要兼容 32 位老机器就改回两个。
+- **字体只留 woff2**。KaTeX 每个字族都同时发 woff2/woff/ttf 三种，CSS 把 woff2 排第一，
+  另两种永远不会被加载（~900 KB 死重量）。构建脚本会自动删。
+- `assets/` 在 APK 里本身就会 deflate，所以 `www` 的 4.6 MB 原文件只占约 1.3 MB。
+
+**debug 与 release 的差异很大。** debug 构建不剥离 native 符号，`libpython` 的 `.so`
+会带着调试信息，体积可能翻倍。当前 CI 出的是 `assembleDebug`（免签名、直接能装），
+所以偏大是预期的。
+
+要显著缩小，需要 **release 构建**（会 strip `.so`），而这需要一把自己的签名密钥：
+
+```bash
+keytool -genkeypair -keystore release.keystore -alias dsh -keyalg RSA -keysize 2048 \
+        -validity 10000 -storepass <你的密码> -keypass <你的密码>
+```
+
+然后把 `release.keystore` 和两个密码存进仓库 Secrets，CI 里还原并加 `signingConfig`。
+这是一次性配置，做成后每次出包都是精简版。未配置前用 debug 也能用，只是大。
+
 ### 几个已知点
 
 - APK 用的是 **debug 签名**（Android SDK 的公共调试密钥）。自己用没问题；要和 release 包共存得先卸载。

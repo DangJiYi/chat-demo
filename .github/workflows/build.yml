@@ -71,6 +71,25 @@ jobs:
         working-directory: android
         run: gradle assembleDebug -PversionName=${{ steps.v.outputs.name }} --no-daemon
 
+      # 体积构成分析：解包 APK 按大小排序，直接看钱花在哪。
+      # 结果写在日志里，也存成 artifact，方便对比改动的效果。
+      - name: Analyze APK size
+        run: |
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          echo "=== total ==="
+          ls -lh "$APK" | awk '{print $5}'
+          echo "=== by top-level dir ==="
+          unzip -l "$APK" | awk 'NR>3 && $4!="" {split($4,p,"/"); s[p[1]]+=$1} END {for (k in s) printf "%10.1f KB  %s\n", s[k]/1024, k}' | sort -rn | head -12
+          echo "=== 30 largest entries ==="
+          unzip -l "$APK" | awk 'NR>3 && $1 ~ /^[0-9]+$/ {printf "%10.1f KB  %s\n", $1/1024, $4}' | sort -rn | head -30
+          unzip -l "$APK" > apk-contents.txt
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: apk-contents
+          path: apk-contents.txt
+          if-no-files-found: warn
+
       - uses: actions/upload-artifact@v5
         with:
           name: dsh-chat-android
