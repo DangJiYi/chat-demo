@@ -50,7 +50,12 @@ jobs:
           '{"id":"s2","title":"会话二","createdAt":1000,"updatedAt":3000,"messages":[]}' |
             Set-Content -Encoding utf8 "data\sessions\s2.json"
 
-          $p = Start-Process -FilePath $exe -ArgumentList '--port','8799','--data','data' `
+          # 造一个最小静态站，验证静态文件与 SPA fallback
+          New-Item -ItemType Directory -Force -Path "www\static\js" | Out-Null
+          Set-Content -Encoding utf8 "www\index.html" '<!doctype html><title>t</title><div id=root></div>'
+          Set-Content -Encoding utf8 "www\static\js\app.js" 'console.log(1)'
+
+          $p = Start-Process -FilePath $exe -ArgumentList '--port','8799','--data','data','--www','www' `
                -PassThru -NoNewWindow -RedirectStandardOutput "out.txt"
           try {
             $ok = $false
@@ -87,6 +92,57 @@ jobs:
 
             $code = (Invoke-WebRequest -Uri "http://127.0.0.1:8799/nope" -SkipHttpErrorCheck).StatusCode
             if ($code -ne 404) { throw "未知路径应返回 404，实际 $code" }
+
+            # ---------- 静态文件 ----------
+            $idx = Invoke-WebRequest -Uri "http://127.0.0.1:8799/" -TimeoutSec 5
+            if ($idx.StatusCode -ne 200) { throw "GET / 应返回 200，实际 $($idx.StatusCode)" }
+            if ($idx.Content -notmatch '<div id=root>') { throw "GET / 未返回 index.html" }
+            if ($idx.Headers['Content-Type'] -notmatch 'text/html') { throw "index.html 的 Content-Type 不对" }
+
+            $js = Invoke-WebRequest -Uri "http://127.0.0.1:8799/static/js/app.js" -TimeoutSec 5
+            if ($js.Headers['Content-Type'] -notmatch 'javascript') { throw "js 的 Content-Type 不对: $($js.Headers['Content-Type'])" }
+            if ($js.Headers['Cache-Control'] -notmatch 'immutable') { throw "static/ 下的资源应为长缓存，实际 $($js.Headers['Cache-Control'])" }
+
+            # SPA fallback：无扩展名的未知路径应返回 index.html
+            $fb = Invoke-WebRequest -Uri "http://127.0.0.1:8799/some/route" -TimeoutSec 5
+            if ($fb.Content -notmatch '<div id=root>') { throw "未知无扩展名路径应回退到 index.html" }
+
+            # 目录穿越必须被拒绝
+            $trav = Invoke-WebRequest -Uri "http://127.0.0.1:8799/../build.gradle" -SkipHttpErrorCheck -TimeoutSec 5
+            if ($trav.StatusCode -eq 200) { throw "目录穿越未被拦下" }
+
+            # ---------- 会话读写 ----------
+            $one = Invoke-RestMethod -Uri "http://127.0.0.1:8799/db/session/s1" -TimeoutSec 5
+            if ($one.id -ne 's1') { throw "GET /db/session/s1 返回错误: $($one.id)" }
+
+            $newDoc = '{"id":"s3","title":"新建","createdAt":5000,"updatedAt":5000,"messages":[]}'
+            $put = Invoke-WebRequest -Uri "http://127.0.0.1:8799/db/session/s3" -Method Put `
+                   -Body $newDoc -ContentType 'application/json' -SkipHttpErrorCheck -TimeoutSec 5
+            if ($put.StatusCode -ne 204) { throw "PUT 应返回 204，实际 $($put.StatusCode)" }
+            if (-not (Test-Path "data\sessions\s3.json")) { throw "PUT 后文件未落盘" }
+
+            # id 与路径不一致必须拒绝（与 Python 版一致的校验）
+            $bad = Invoke-WebRequest -Uri "http://127.0.0.1:8799/db/session/wrong" -Method Put `
+                   -Body $newDoc -ContentType 'application/json' -SkipHttpErrorCheck -TimeoutSec 5
+            if ($bad.StatusCode -ne 500) { throw "id 不一致应返回 500，实际 $($bad.StatusCode)" }
+            if ($bad.Content -notmatch 'id 不一致') { throw "错误文案未说明 id 不一致: $($bad.Content)" }
+
+            $ren = Invoke-WebRequest -Uri "http://127.0.0.1:8799/db/session/s3/rename" -Method Post `
+                   -Body '{"title":"改名了"}' -ContentType 'application/json' -SkipHttpErrorCheck -TimeoutSec 5
+            if ($ren.StatusCode -ne 204) { throw "rename 应返回 204，实际 $($ren.StatusCode)" }
+            $after = Invoke-RestMethod -Uri "http://127.0.0.1:8799/db/session/s3" -TimeoutSec 5
+            if ($after.title -ne '改名了') { throw "改名未生效: $($after.title)" }
+
+            $del = Invoke-WebRequest -Uri "http://127.0.0.1:8799/db/session/s3" -Method Delete -SkipHttpErrorCheck -TimeoutSec 5
+            if ($del.StatusCode -ne 204) { throw "DELETE 应返回 204，实际 $($del.StatusCode)" }
+            # 删除是写墓碑，不是删文件（同步靠它得知“这条被删了”）
+            if (-not (Test-Path "data\sessions\s3.json")) { throw "删除不应移除文件，只写墓碑" }
+            $delDoc = Get-Content "data\sessions\s3.json" -Raw | ConvertFrom-Json
+            if (-not $delDoc.deleted) { throw "墓碑标记缺失" }
+
+            # 墓碑不能出现在列表里
+            $raw2 = (Invoke-WebRequest -Uri "http://127.0.0.1:8799/db/summaries" -TimeoutSec 5).Content
+            if ($raw2 -match '"s3"') { throw "墓碑会话不应出现在 /db/summaries" }
 
             Write-Host '自检通过'
           } finally {

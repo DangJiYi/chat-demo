@@ -75,13 +75,23 @@ spec 里是 `console=False`，所以 exe 不再弹控制台，而是常驻**系�
 `rust/` 是后端重写工程，目标是用一份代码同时覆盖 Windows exe 和安卓 `.so`，
 摆脱 Python 运行时（约省 13.6 MB）。
 
-**目前只实现了骨架**，用于验证链路是否成立：
+**进度：静态文件 + 会话读写已实现。**
 
 ```text
-GET /local/status     服务状态（版本、数据目录、平台）
-GET /db/summaries     会话摘要列表（扫 sessions/*.json，按 updatedAt 倒序）
-GET /health           存活检查
+GET  /                      静态文件（含 SPA fallback 与目录穿越防护）
+GET  /static/*              长缓存资源
+GET  /local/status          服务状态
+GET  /local/storage         存储占用
+GET  /health                存活检查
+GET  /db/summaries          会话摘要（扫目录，按 updatedAt 倒序）
+GET  /db/session/<id>       读会话原文
+PUT  /db/session/<id>       存会话（校验 id 一致）
+POST /db/session/<id>/rename  改标题
+DELETE /db/session/<id>     删会话（写墓碑，不删文件）
 ```
+
+**还差的**：`/db/file/*` 与 `/db/staging/*`、`/local/*` 剩余端点、
+同步端口 8791、UDP 发现 8792、安卓壳。
 
 其余端点按 `server.py` 逐个移植。**协议必须一致**——前端的
 `src/local/api.ts` 与 `src/services/chat/db.ts` 不改一行。
