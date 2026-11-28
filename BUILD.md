@@ -608,6 +608,38 @@ cd android && gradle assembleDebug
 后端侧不需要额外工作：这三条路径（`/v1/tools/*`、`/anthropic/v1/files`）
 都已经由反向代理覆盖。
 
+#### 录音：别把采样率定到 16k
+
+修完上面三样之后还有一个必现的坑：`new AudioContext({ sampleRate: 16000 })`
+在安卓 WebView 上会抛 `NotSupportedError`（硬件只跑 44.1k/48k），
+异常让录音状态立刻回 idle——**表现为「一闪就没了，没时间说话」**。
+
+现在的做法（`services/speech/recorder.ts`）：
+
+1. 先试 16k，失败就回退到默认采样率；
+2. 真正用的采样率一律读 `context.sampleRate`，不信自己请求的值
+   （有些浏览器不报错而是静默给别的值）；
+3. 编码 WAV 时用盒式滤波降到 16k（平均而不是直接抽取，避免高频折叠成噪声）。
+
+预分配整段缓冲（`MAX_SECONDS × 采样率`）而不是攒小数组：
+48k 下 120 秒约 23 MB，总量和原来相当，但没有几十次小块分配。
+
+#### 图片：HEIC 上传前转码
+
+上游接口不接受 `image/heic`，而 iPhone 相册直出就是它。
+官方 0.1.4 的 `uploadExts.ts` 直接把 heic/heif 排除在外，所以「格式不支持」。
+
+现在的做法（`utils/resizeUploadImage.ts`）：
+
+- `heic` / `heif` 加回上传白名单，但**上传前一定转成 JPEG**（与尺寸无关）；
+- 其余图片维持原行为：长边超过 4096 才缩放，否则原样发，不重编码；
+- 转码依赖平台自己的 HEIF 解码（Android 9+、iOS Safari 有，**桌面 Chrome 没有**）；
+- 解不了时抛 `UnsupportedImageError`，界面显示「格式不支持，请转换」，
+  并且**不给「点击重试」**——重试多少次都一样；
+- 转 JPEG 前先铺白底，否则透明区会变黑块；质量取 0.92。
+
+要看某平台到底能不能解码 HEIC，直接试传一张：能转成 `.jpg` 就是支持。
+
 ### 安卓壳做了什么
 
 安卓已经没有 Python 了。现在是一个 .so + 一层 WebView：

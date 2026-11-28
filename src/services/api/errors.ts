@@ -1,3 +1,4 @@
+import { UnsupportedImageError } from '../../utils/resizeUploadImage.js'
 import { ApiError } from './client.js'
 
 /**
@@ -45,6 +46,11 @@ export const classifyApiError = (error: unknown): ApiErrorCondition => {
 
 /** 重试可能成功的情况：网络、限流、服务端繁忙；参数或鉴权类错误重试无用 */
 export const isRetryableApiError = (error: unknown): boolean => {
+  // 图片解不了是格式问题，不是网络/配额问题——重试多少次结果都一样。
+  // 不排除的话界面会给出一个永远失败的「点击重试」。
+  if (error instanceof UnsupportedImageError) {
+    return false
+  }
   const condition = classifyApiError(error)
   return (
     !(error instanceof ApiError) ||

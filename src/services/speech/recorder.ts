@@ -1,8 +1,14 @@
 /**
  * 录音并编码为 ASR 接受的 WAV（单声道、16-bit PCM、16kHz）。
  *
- * AudioContext 以 16kHz 创建，浏览器负责重采样；ScriptProcessorNode 采集 PCM 样本。
- * 录音处理在页面内完成。
+ * 采样链路：getUserMedia → createMediaStreamSource → analyser → ScriptProcessor。
+ * 录音处理在页面内完成，不依赖 MediaRecorder（安卓 WebView 对它支持不稳定）。
+ *
+ * **采样率不能硬编码成 16k。** 安卓 WebView 的 AudioContext 只能跑硬件采样率
+ * （通常 44.1k/48k），`new AudioContext({ sampleRate: 16000 })` 会抛
+ * NotSupportedError。那个异常会让录音按钮“闪一下就没了”——状态立刻回 idle，
+ * 用户根本没机会说话。所以这里：先试 16k，失败就退回默认采样率，
+ * 在 encodeWav 里重采样到 16k（ASR 要的格式）。
  */
 export const SAMPLE_RATE = 16000
 /** ASR 单次时长上限 120 秒 */
@@ -17,6 +23,22 @@ export type Recording = {
   cancel: () => void
   /** 频谱分析节点，只读；采样率与录音一致 */
   analyser: AnalyserNode
+}
+
+/**
+ * 建 AudioContext。
+ *
+ * 优先用 16k：能省掉重采样，也最贴近上游期望。
+ * 安卓上这个请求基本都会失败（硬件只支持 44.1k/48k），于是回退到默认采样率。
+ * 两条路径都返回可用的 context；真正的采样率一律从 `context.sampleRate` 读，
+ * 不信我们请求的那个值——有些浏览器不抛错，而是静默给一个不同的采样率。
+ */
+const createContext = (): AudioContext => {
+  try {
+    return new AudioContext({ sampleRate: SAMPLE_RATE })
+  } catch {
+    return new AudioContext()
+  }
 }
 
 /** 开始录音；到达时长上限时调用 onLimit，由调用方决定何时 stop */
@@ -53,23 +75,38 @@ export const startRecording = async (onLimit: () => void): Promise<Recording> =>
   }
 
   try {
-    context = new AudioContext({ sampleRate: SAMPLE_RATE })
+    context = createContext()
+    const inputRate = context.sampleRate
+    // 预分配整段上限的缓冲：边采边写，省掉一堆小 Float32Array 和它们的 GC。
+    // 48k 下 120 秒约 23 MB，和原来攒 chunks 的总量相当，但峰值更可控。
+    const capacity = Math.ceil(MAX_SECONDS * inputRate)
+    const buffer = new Float32Array(capacity)
+    let filled = 0
+    let limited = false
+
     source = context.createMediaStreamSource(stream)
     processor = context.createScriptProcessor(BUFFER_SIZE, 1, 1)
     // 频谱分析用：串在录音链路中间（原样透传），WebKit 不会处理未连到输出的分析节点
     analyser = context.createAnalyser()
     analyser.fftSize = 512
     analyser.smoothingTimeConstant = 0.2
-    const chunks: Float32Array[] = []
-    let length = 0
-    let limited = false
+
     processor.onaudioprocess = (event) => {
       if (limited) {
         return
       }
-      chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)))
-      length += BUFFER_SIZE
-      if (length >= MAX_SECONDS * SAMPLE_RATE) {
+      const data = event.inputBuffer.getChannelData(0)
+      const room = capacity - filled
+      if (room <= 0) {
+        limited = true
+        onLimit()
+        return
+      }
+      // 输入块比剩余空间大时只取前一段，避免越界写入
+      const take = Math.min(room, data.length)
+      buffer.set(take === data.length ? data : data.subarray(0, take), filled)
+      filled += take
+      if (filled >= capacity) {
         limited = true
         onLimit()
       }
@@ -85,8 +122,10 @@ export const startRecording = async (onLimit: () => void): Promise<Recording> =>
 
     return {
       stop: async () => {
+        const rate = inputRate
+        const taken = filled
         release()
-        return length === 0 ? null : encodeWav(chunks, length)
+        return taken === 0 ? null : encodeWav(buffer.subarray(0, taken), rate)
       },
       cancel: release,
       analyser,
@@ -97,9 +136,38 @@ export const startRecording = async (onLimit: () => void): Promise<Recording> =>
   }
 }
 
-const encodeWav = (chunks: Float32Array[], length: number) => {
-  const samples = Math.min(length, MAX_SECONDS * SAMPLE_RATE)
-  const buffer = new ArrayBuffer(44 + samples * 2)
+/**
+ * 盒式滤波降采样（线性平均）。
+ *
+ * 用平均而不是直接抽取：直接每 N 个取一个会把高频折回来变成噪声
+ * （48k → 16k 时尤其明显），平均相当于一个粗糙的低通，语音识别更准。
+ * 任意比例都成立，不要求整除。
+ */
+const resample = (input: Float32Array, from: number, to: number): Float32Array => {
+  if (from === to) {
+    return input
+  }
+  const ratio = from / to
+  const outLength = Math.max(1, Math.floor(input.length / ratio))
+  const out = new Float32Array(outLength)
+  for (let i = 0; i < outLength; i++) {
+    const start = Math.floor(i * ratio)
+    const end = Math.min(input.length, Math.floor((i + 1) * ratio))
+    let sum = 0
+    let count = 0
+    for (let j = start; j < end; j++) {
+      sum += input[j]
+      count++
+    }
+    out[i] = count > 0 ? sum / count : 0
+  }
+  return out
+}
+
+/** 把采集到的浮点样本编码成 16k 单声道 16-bit PCM 的 WAV。 */
+const encodeWav = (input: Float32Array, inputRate: number) => {
+  const samples = resample(input, inputRate, SAMPLE_RATE)
+  const buffer = new ArrayBuffer(44 + samples.length * 2)
   const view = new DataView(buffer)
   const writeString = (offset: number, text: string) => {
     for (let i = 0; i < text.length; i++) {
@@ -107,7 +175,7 @@ const encodeWav = (chunks: Float32Array[], length: number) => {
     }
   }
   writeString(0, 'RIFF')
-  view.setUint32(4, 36 + samples * 2, true)
+  view.setUint32(4, 36 + samples.length * 2, true)
   writeString(8, 'WAVE')
   writeString(12, 'fmt ')
   view.setUint32(16, 16, true)
@@ -118,15 +186,12 @@ const encodeWav = (chunks: Float32Array[], length: number) => {
   view.setUint16(32, 2, true)
   view.setUint16(34, 16, true)
   writeString(36, 'data')
-  view.setUint32(40, samples * 2, true)
+  view.setUint32(40, samples.length * 2, true)
   let offset = 44
-  let written = 0
-  for (const chunk of chunks) {
-    for (let i = 0; i < chunk.length && written < samples; i++, written++) {
-      const sample = Math.max(-1, Math.min(1, chunk[i]))
-      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true)
-      offset += 2
-    }
+  for (let i = 0; i < samples.length; i++) {
+    const sample = Math.max(-1, Math.min(1, samples[i]))
+    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true)
+    offset += 2
   }
   return new Blob([buffer], { type: 'audio/wav' })
 }

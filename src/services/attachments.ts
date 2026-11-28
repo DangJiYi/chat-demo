@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import type { LinkedMessage, TranslationMessage } from '../i18n/index.js'
 import { getAbortReason, throwIfAborted } from '../utils/abort.js'
-import { isUploadImageOversized } from '../utils/resizeUploadImage.js'
+import { isUploadImageOversized, UnsupportedImageError } from '../utils/resizeUploadImage.js'
 import { uploadFile } from './api/client.js'
 import { classifyApiError, getUploadErrorInfo, isRetryableApiError } from './api/errors.js'
 import type { FilePurpose } from './api/types.js'
@@ -66,6 +66,11 @@ export const validateFiles = (files: File[], currentCount: number): TranslationM
  * 服务端原文多为英文且较长，不直接展示。
  */
 export const describeUploadError = (error: unknown): TranslationMessage => {
+  // 图片平台解不了（典型是桌面 Chrome 上的 HEIC）：用户能做的就是换格式，
+  // 报“上传失败”会让人以为重试有用。
+  if (error instanceof UnsupportedImageError) {
+    return { key: 'uploadUnsupportedFormat' }
+  }
   if (classifyApiError(error) === 'serverBusy') {
     return { key: 'uploadServerBusy' }
   }

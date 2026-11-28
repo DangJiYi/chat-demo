@@ -1,5 +1,10 @@
 /**
- * 允许上传的文件扩展名清单；不含 heic / heif。
+ * 允许上传的文件扩展名清单。
+ *
+ * heic / heif 在此列，但**上传前一定会被转成 JPEG**（见
+ * utils/resizeUploadImage.ts）：上游接口不接受 HEIC，而 iPhone 相册直出就是它。
+ * 转换依赖平台自身的 HEIF 解码能力（Android 9+、iOS Safari 都有），
+ * 解不了时会在校验阶段报“格式不支持”，而不是把 HEIC 盲发上去换个上游错误。
  */
 export const ACCEPT_FILE_EXTS: string[] = [
   'wxml',
@@ -17,6 +22,8 @@ export const ACCEPT_FILE_EXTS: string[] = [
   'png',
   'jpg',
   'jpeg',
+  'heic',
+  'heif',
   'svg',
   'svgz',
   'bmp',
