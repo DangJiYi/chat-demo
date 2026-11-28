@@ -16,7 +16,10 @@ rem   2. Keep this file pure ASCII. cmd parses .bat as GBK/ANSI, so CJK bytes
 rem      inside an `if (` block can corrupt the block and kill the script.
 rem      Chinese notes live in BUILD.md instead.
 
-chcp 437 >nul
+rem Console codepage. This MUST match what push.py writes (it reconfigures
+rem its stdout to UTF-8). Mismatch is exactly what produced mojibake before:
+rem chcp 437 here + UTF-8 bytes from Python = garbage. Both sides are 65001 now.
+chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
 set RC=1
