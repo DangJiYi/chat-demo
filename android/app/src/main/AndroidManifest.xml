@@ -3,6 +3,9 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 语音输入：WebView 的 getUserMedia 同时需要这条系统权限
+         和 WebChromeClient.onPermissionRequest 放行，少一个就是“点了没反应”。 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
         android:allowBackup="false"

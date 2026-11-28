@@ -1,9 +1,12 @@
 package com.dangjiyi.dshchat;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.content.res.AssetManager;
 import android.graphics.Color;
+import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Bundle;
 import android.util.Log;
@@ -11,7 +14,9 @@ import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.ConsoleMessage;
+import android.webkit.PermissionRequest;
 import android.webkit.SslErrorHandler;
+import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
@@ -54,8 +59,16 @@ public class MainActivity extends Activity {
     private static final int PORT = 8790;
     private static final long BOOT_TIMEOUT_MS = 30_000L;
 
+    // 选文件 / 录音授权的请求码（onActivityResult / onRequestPermissionsResult 用）
+    private static final int REQ_FILE = 1001;
+    private static final int REQ_MIC = 1002;
+
     private WebView webView;
     private TextView errorView;
+    // <input type="file"> 的回调，要等用户选完文件才能交付
+    private ValueCallback<Uri[]> pendingFileCallback;
+    // 等系统录音权限结果时暂存的网页授权请求
+    private PermissionRequest pendingPermission;
     // 盖在 WebView 上面的诊断遮罩；成功加载后必须整个隐藏，否则会吃掉所有触摸
     private ScrollView overlay;
     private final StringBuilder diag = new StringBuilder();
@@ -146,9 +159,134 @@ public class MainActivity extends Activity {
                 diag.append(line).append('\n');
                 return true;
             }
+
+            /**
+             * 网页要麦克风（语音输入）。
+             *
+             * WebView 默认**直接拒绝**所有 getUserMedia，不给任何提示——
+             * 界面上的录音按钮看起来就是“点了没反应”。必须在这里放行，
+             * 而且系统级 RECORD_AUDIO 权限也得先拿到（见 ensureMicPermission）。
+             */
+            @Override
+            public void onPermissionRequest(final PermissionRequest request) {
+                runOnUiThread(() -> {
+                    boolean wantsAudio = false;
+                    for (String res : request.getResources()) {
+                        if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(res)) {
+                            wantsAudio = true;
+                        }
+                    }
+                    if (!wantsAudio) {
+                        request.deny();
+                        return;
+                    }
+                    if (hasMicPermission()) {
+                        request.grant(new String[]{PermissionRequest.RESOURCE_AUDIO_CAPTURE});
+                    } else {
+                        pendingPermission = request;
+                        requestPermissions(
+                                new String[]{android.Manifest.permission.RECORD_AUDIO}, REQ_MIC);
+                    }
+                });
+            }
+
+            /**
+             * 网页要打开文件选择器（附件上传）。
+             *
+             * 不实现这个回调，`<input type="file">` 在 WebView 里点下去毫无反应：
+             * 安卓不会自己弹选择器，必须宿主去 startActivityForResult。
+             */
+            @Override
+            public boolean onShowFileChooser(
+                    WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
+                // 上一次的还没交付就丢掉，避免回调泄漏
+                if (pendingFileCallback != null) {
+                    pendingFileCallback.onReceiveValue(null);
+                }
+                pendingFileCallback = callback;
+                try {
+                    Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    intent.setType("*/*");
+                    if (params != null && params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE) {
+                        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                    }
+                    String[] accept = params == null ? null : params.getAcceptTypes();
+                    if (accept != null && accept.length > 0 && !accept[0].isEmpty()) {
+                        intent.putExtra(Intent.EXTRA_MIME_TYPES, accept);
+                    }
+                    startActivityForResult(Intent.createChooser(intent, "选择文件"), REQ_FILE);
+                } catch (Throwable t) {
+                    Log.e(TAG, "打开文件选择器失败", t);
+                    pendingFileCallback = null;
+                    callback.onReceiveValue(null);
+                    return false;
+                }
+                return true;
+            }
         });
 
         new Thread(this::boot, "dsh-boot").start();
+    }
+
+    // ---------------------------------------------------------------- 权限与文件选择
+
+    /** 是否已有录音权限（API 23+，本项目 minSdk 24）。 */
+    private boolean hasMicPermission() {
+        return checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /** 用户选完文件（或取消）：把结果交给仍在等待的网页回调。 */
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode != REQ_FILE) {
+            super.onActivityResult(requestCode, resultCode, data);
+            return;
+        }
+        ValueCallback<Uri[]> cb = pendingFileCallback;
+        pendingFileCallback = null;
+        if (cb == null) {
+            return;
+        }
+        if (resultCode != RESULT_OK || data == null) {
+            cb.onReceiveValue(null);
+            return;
+        }
+        Uri[] result = null;
+        if (data.getClipData() != null) {
+            int n = data.getClipData().getItemCount();
+            result = new Uri[n];
+            for (int i = 0; i < n; i++) {
+                result[i] = data.getClipData().getItemAt(i).getUri();
+            }
+        } else if (data.getData() != null) {
+            result = new Uri[]{data.getData()};
+        }
+        cb.onReceiveValue(result);
+    }
+
+    /** 录音权限结果：拿到就放行网页的麦克风请求，否则明确拒绝。 */
+    @Override
+    public void onRequestPermissionsResult(
+            int requestCode, String[] permissions, int[] grantResults) {
+        if (requestCode != REQ_MIC) {
+            super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+            return;
+        }
+        PermissionRequest req = pendingPermission;
+        pendingPermission = null;
+        if (req == null) {
+            return;
+        }
+        boolean granted = grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        if (granted) {
+            req.grant(new String[]{PermissionRequest.RESOURCE_AUDIO_CAPTURE});
+        } else {
+            req.deny();
+            Log.w(TAG, "用户拒绝了录音权限，语音输入不可用");
+        }
     }
 
     private void boot() {
