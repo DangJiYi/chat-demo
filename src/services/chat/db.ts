@@ -112,6 +112,13 @@ export const clearStaging = async (): Promise<void> => {
   await send('/staging/clear', { method: 'POST' })
 }
 
+/**
+ * 暂存一个会话。
+ *
+ * 官方 0.1.4 把它改成了批量的 `addStagingSessions`（IndexedDB 一个事务写完），
+ * 我们这边是一个会话一个 HTTP PUT。所以下面那个批量版本只是循环，
+ * **不合并成单个请求**：服务端按会话 id 落盘，合并没有收益，反而会加大失败重试粒度。
+ */
 export const addStagingSession = async (session: Session): Promise<void> => {
   await send(`/staging/session/${encodeURIComponent(session.id)}`, {
     method: 'PUT',
@@ -120,14 +127,30 @@ export const addStagingSession = async (session: Session): Promise<void> => {
   })
 }
 
+/** 批量暂存（官方 0.1.4 的接口名，导入器在用它）。 */
+export const addStagingSessions = async (sessions: Session[]): Promise<void> => {
+  for (const session of sessions) {
+    await addStagingSession(session)
+  }
+}
+
 export const saveStagingFiles = async (files: StoredFile[]): Promise<void> => {
   for (const file of files) {
     await putBlob(`/staging/file/${encodeURIComponent(file.id)}`, file)
   }
 }
 
-/** 图片位于会话 JSON 之后；全部读完后回填具体 MIME，保留归档给出的 isImage 标识。 */
-export const updateStagingFileTypes = async (types: ReadonlyMap<string, string>): Promise<void> => {
+/**
+ * 图片位于会话 JSON 之后；全部读完后回填具体 MIME，保留归档给出的 isImage 标识。
+ *
+ * `sessionIds` 在官方实现里用来缩小 IndexedDB 的扫描范围。
+ * 我们这份由服务端处理：它本来就按附件 id 匹配所有暂存会话，
+ * 结果一致。参数保留只为与官方调用点签名兼容，服务端不需要它。
+ */
+export const updateStagingFileTypes = async (
+  types: ReadonlyMap<string, string>,
+  _sessionIds?: ReadonlySet<string>
+): Promise<void> => {
   await send('/staging/filetypes', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

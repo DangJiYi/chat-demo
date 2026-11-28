@@ -13,10 +13,22 @@ name: rust-build
 
 on:
   push:
+    # **push 到 main 就构建。** 少这一行就只能手点 Run workflow——
+    # 以前这里只监听 tag，所以推代码“没反应”，必须去网页手动触发。
+    branches: [main]
+    # tag 也构建：发版时想用 v* 当版本号就推 tag
     tags: ['v*']
   workflow_dispatch:
 
+# 同一分支的新推送取消旧运行：省额度，也避免拿旧 commit 的产物。
+# 注意 group 里带 github.ref，main 和 tag 各算一组，不会互相取消。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
+  # read：正常构建只需读代码。
+  # 失败日志要推回 ci-log 分支，那里单独提权（见 Publish build log）。
   contents: read
 
 jobs:
@@ -446,7 +458,7 @@ jobs:
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             echo "name=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
-            echo "name=0.2.3-$(date -u +%Y%m%d%H%M)" >> "$GITHUB_OUTPUT"
+            echo "name=0.2.4-$(date -u +%Y%m%d%H%M)" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build APK

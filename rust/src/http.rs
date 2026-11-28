@@ -19,6 +19,44 @@ fn header(name: &[u8], value: &[u8]) -> Header {
     Header::from_bytes(name, value).expect("static header")
 }
 
+// ------------------------------------------------------------------ 请求上下文
+
+thread_local! {
+    /// 当前线程正在处理的请求：(方法, 路径)。
+    ///
+    /// `send_error` 没有 Store 也没有路径参数，但 4xx 必须能记下来
+    /// （否则界面上看到 400、日志里什么都没有）。放在 thread_local 里，
+    /// 每个请求一个线程，不会串台。
+    static CTX: std::cell::RefCell<(String, String)> =
+        std::cell::RefCell::new((String::new(), String::new()));
+}
+
+fn set_ctx(method: &str, path: &str) {
+    CTX.with(|c| {
+        *c.borrow_mut() = (method.to_string(), path.to_string());
+    });
+}
+
+fn ctx() -> (String, String) {
+    CTX.with(|c| {
+        let c = c.borrow();
+        (c.0.clone(), c.1.clone())
+    })
+}
+
+/// 只记接口路径的错误，不记静态资源的 404。
+///
+/// 静态缺失是正常现象（SPA 的 favicon、被删的 hash 资源），
+/// 每条都写日志会把真正的问题淹掉。
+fn should_log_path(path: &str) -> bool {
+    ["/local/", "/db/", "/sync/", "/file/", "/peer"]
+        .iter()
+        .any(|p| path.starts_with(p))
+        || path == "/models"
+        || path.starts_with("/anthropic/")
+        || path.starts_with("/v1/")
+}
+
 fn json_ct() -> Header {
     header(b"Content-Type", b"application/json; charset=utf-8")
 }
@@ -49,6 +87,14 @@ pub fn send_json<T: Serialize>(req: Request, code: u16, value: &T) {
 }
 
 fn send_error(req: Request, code: u16, msg: &str) {
+    // 业务拒绝也要记。这类 4xx/5xx 不是异常，不会进 catch 分支：
+    // 如果只依靠前端报错，界面上看到 400 而日志里什么都没有。
+    if code >= 400 {
+        let (method, path) = ctx();
+        if should_log_path(&path) {
+            crate::applog::write_global(&format!("{code} {method} {path} - {msg}"));
+        }
+    }
     #[derive(Serialize)]
     struct ErrBody {
         error: String,
@@ -263,6 +309,11 @@ pub fn handle(mut req: Request, st: &'static Store, www: &Path, version: &str) {
     let url = req.url().to_string();
     let raw_path = url.split('?').next().unwrap_or("/").to_string();
 
+    // 记下当前路径与请求方法，供 send_error 写日志。
+    // 用 thread_local 是因为一个请求一个线程（见 lib.rs 的 spawn），
+    // 普通静态字段会被其他请求覆盖，日志就串台了。
+    set_ctx(method.as_str(), &raw_path);
+
     // 前端把「数据层」接口挂在 /local/db/*（见 src/services/chat/db.ts 里的 BASE），
     // 而「本机设置」接口是 /local/*（见 src/local/api.ts）。Python 版在分发前
     // 统一剥掉 /local 前缀，这里对数据层做同样的事。
@@ -306,6 +357,11 @@ pub fn handle(mut req: Request, st: &'static Store, www: &Path, version: &str) {
             local_ips: Vec<String>,
             #[serde(rename = "deviceName")]
             device_name: String,
+            /// 最近的运行日志（尾部 40 行）。
+            ///
+            /// 界面的诊断面板直接读它，不用另外发一次请求：
+            /// 前端本来就在轮询 status，顺手带回就够。
+            log: Vec<String>,
         }
         let cfg = st.config();
         // 报**实际**在监听的端口，而不是配置值。
@@ -339,7 +395,36 @@ pub fn handle(mut req: Request, st: &'static Store, www: &Path, version: &str) {
                 platform: std::env::consts::OS.to_string(),
                 local_ips: crate::sync::local_ips(),
                 device_name,
+                log: crate::applog::tail_from(st.dir(), 40),
             },
+        );
+        return;
+    }
+
+    // ---------- /local/log ----------
+    //
+    // 前端主动上报错误（接口失败、JS 异常、未处理的 Promise 拒绝）。
+    //
+    // **刻意不用 JSON 解析**：上报的内容里有用户输入、堆栈、路径，
+    // 任何“这条不合法”都不应该让记录失败——“要把错误存下来”这件事
+    // 本身绝不能失败。读多少写多少，截断到 600 字符一行。
+    if path == "/local/log" && method == Method::Post {
+        let mut raw = String::new();
+        let _ = req.as_reader().take(8192).read_to_string(&mut raw);
+        let one_line: String = raw
+            .trim()
+            .replace('\r', " ")
+            .replace('\n', " ")
+            .chars()
+            .take(600)
+            .collect();
+        if !one_line.is_empty() {
+            crate::applog::write_global(&format!("[client] {one_line}"));
+        }
+        send_json(
+            req,
+            200,
+            &serde_json::json!({ "logged": !one_line.is_empty() }),
         );
         return;
     }
@@ -1423,6 +1508,9 @@ pub fn handle_sync(mut req: Request, st: &'static Store, version: &str) {
     let method = req.method().clone();
     let url = req.url().to_string();
     let path = url.split('?').next().unwrap_or("/").to_string();
+
+    // 同 UI 端口：让 4xx 能落到日志里（对端拉取失败时很关键）。
+    set_ctx(method.as_str(), &path);
 
     if path == "/health" && method == Method::Get {
         #[derive(Serialize)]

@@ -1,5 +1,7 @@
 // 与服务端本地接口通信的薄封装。所有请求都同源，不需要处理跨域。
 
+import { reportError } from './diagnostics.js'
+
 /** 前端保存到 localStorage 的占位值：真正的 Key 只在服务端，浏览器永远拿不到 */
 export const SERVER_KEY = '__server__'
 
@@ -36,6 +38,10 @@ export type KeyStatus = { configured: boolean; hint: string }
 
 const json = async <T,>(res: Response): Promise<T> => {
   if (!res.ok) {
+    // 本机接口失败也送上日志：界面会抛错，但抛到哪里取决于调用方，
+    // 很多地方是 catch 掉就完的（轮询、侧边栏刷新）。
+    // 这里统一记一下，保证“用户看到不对”和“日志里有记录”同时成立。
+    reportError(`${res.url || 'local'}`, `HTTP ${res.status}`)
     throw new Error(`HTTP ${res.status}`)
   }
   return (await res.json()) as T
@@ -125,6 +131,8 @@ export type DeviceStatus = {
   platform: string
   localIps?: string[]
   deviceName?: string
+  /** 最近的运行日志（尾部 40 行），诊断面板直接渲染它 */
+  log?: string[]
 }
 
 export type StorageInfo = {

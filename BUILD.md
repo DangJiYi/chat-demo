@@ -361,6 +361,57 @@ python tools/make-icons.py
 `.ico` 缺位时（比如没跑过脚本）全部降级：托盘与 exe 用系统默认图标，
 构建照常成功，`cargo` 会打一条 warning 说明原因。
 
+### 一条命令发布（push.bat）
+
+提交、推送，构建随即在 GitHub 上自动开始：
+
+```bat
+push.bat                     rem 提交全部改动并推送
+push.bat 修好语音输入         rem 自定义提交信息
+push.bat --dry-run           rem 只看会提交什么，不推
+```
+
+纯推送脚本，**不需要任何令牌**。`tools/push.py` 只做 add / commit / push，
+然后打印 Actions 链接；它不掺版本号、不打 tag、也不假装知道构建结果。
+
+自动触发靠工作流的触发条件：
+
+```yaml
+on:
+  push:
+    branches: [main]   # ← 关键：早期这里只写了 tags，所以推代码没反应
+    tags: ['v*']
+  workflow_dispatch:
+```
+
+> 这是本项目之前「必须手点 Run workflow」的根因：`on.push` 里只有 `tags`。
+> 另一个项目能全自动，是因为它写了 `branches: [main]`。
+
+工作流另有 `concurrency`：同一分支的新推送会取消旧运行，省额度，
+也避免拿到旧 commit 的产物。`main` 与 tag 各算一组，不会互相取消。
+
+要发版就打 tag（版本号会取 tag 名）：
+
+```bat
+git tag v0.2.4
+git push origin v0.2.4
+```
+
+### 官方发新版本时
+
+拿到的通常只有构建产物（`static/js/main.*.js`）。先跑一下对比，
+确认到底有没有用户可见的变化，再决定值不值得投入：
+
+```bat
+python tools/compare-official.py path\to\official\main.xxxx.js
+```
+
+它比较中文字符串与标识符，并给一个结论。注意官方是纯静态版（IndexedDB），
+我们走本地服务，所以标识符天然会大量不重合——**真正有意义的是中文串差集**。
+
+如果官方只是修 bug、没有新 UI 文案，那就需要它的**源码**才能吸收；
+压缩包里的 minified bundle 无法合并。
+
 ### 单文件发布与自动开界面
 
 `build.rs` 把 `chat/www/` 下的每个文件变成 `include_bytes!`，直接编进 exe：
@@ -454,7 +505,39 @@ index.html 的实例，断言 `/`、SPA 回退、静态资源都能从内嵌拿�
   启动参数、同步失败原因、归档结果都写在这里，界面的「存储占用」也显示它的大小。
   同步失败只在**错误内容变化**时记一行——对端离线时每 3 秒重试一次，
   逐次记录会把日志刷满。
-- 托盘只用 `windows-sys` 里几个系统调用，不引 GUI 框架；图标暂时是系统默认图标。
+- 托盘只用 `windows-sys` 里几个系统调用，不引 GUI 框架。
+
+### 运行日志：把静默失败变成可见（`data/app.log`）
+
+这个项目里最耗时间的一类 bug 共同点是**不报错**：点按钮没反应、界面显示
+不对但控制台干净。用户只能描述“不行”，开发者只能猜。
+
+所以把所有失败统一送到一个能看见的地方：
+
+| 来源 | 怎么进日志 |
+| :--- | :--- |
+| 启动 / 同步 / 归档 | `applog::write(store, …)` |
+| 服务端 4xx/5xx | `send_error` 自动记（只限接口路径，不记静态 404） |
+| 前端接口失败 | `api.ts` 的 `json()` 上报 |
+| 前端 JS 异常 / 未处理的 Promise | `installDiagnostics()` 装全局钩子 |
+
+`POST /local/log` 收前端上报。它**刻意不解析 JSON**：上报内容里有用户输入、
+堆栈、路径，任何“这条不合法”都不应该让记录失败——把错误存下来这件事本身
+绝不能失败。读多少写多少，截断到 600 字符一行。
+
+4xx 由 `send_error` 统一记，靠 `thread_local` 拿当前路径（一个请求一个线程，
+普通静态字段会被其他请求覆盖，日志就串台了）。只记 `/local`、`/db`、
+`/sync`、`/file`、`/peer`、`/models`、`/anthropic`、`/v1` 开头的路径——
+静态资源 404 是正常现象，每条都记会把真正的问题淹掉。
+
+界面在「本地与同步」面板底部渲染最近 40 行，随 status 轮询自动刷新，
+另有「刷新 / 复制」两个按钮。维护时注意：**指纹只算日志内容，不算整个
+status 对象**——里面的 `uptimeSec` 每次都变，拿整个对象当指纹会让面板每 4 秒
+白重绘一次，把正在看的日志滚动位置重置掉。
+
+> 这套东西的价值不在“能记录”，而在把静默失败变成可见失败。
+> 一条 `[client] POST /local/sync/now -> HTTP 400` 就能直接定位到接口。
+> 对应测试：`tests/smoke.rs` 的 `client_log_reaches_status`。
 
 ### 设计约束
 
@@ -506,6 +589,24 @@ cd android && gradle assembleDebug
 ```
 
 产物：`android/app/build/outputs/apk/debug/app-debug.apk`。
+
+### 安卓的语音输入与文件上传
+
+前端代码本来就支持（`getUserMedia` 录音 → `/v1/tools/asr`，`<input type=file>` → `/anthropic/v1/files`），
+但只靠 WebView **两个都用不了**，缺三样宿主侧的东西：
+
+| 缺什么 | 症状 | 补在哪 |
+| :--- | :--- | :--- |
+| `RECORD_AUDIO` 权限 | 点录音没反应 | `AndroidManifest.xml` |
+| `WebChromeClient.onPermissionRequest` | WebView 默认**静默拒绝**所有 `getUserMedia` | `MainActivity` |
+| `WebChromeClient.onShowFileChooser` | 点选文件毫无反应（安卓不会自己弹选择器） | `MainActivity` + `onActivityResult` |
+
+三样都是「不报错、就是没反应」的失败方式，很难从界面上看出来。
+现在录音会先申请系统权限（`REQ_MIC`），拿到后才放行网页的音频请求；
+选文件走 `ACTION_GET_CONTENT`，支持多选，结果回交给 `pendingFileCallback`。
+
+后端侧不需要额外工作：这三条路径（`/v1/tools/*`、`/anthropic/v1/files`）
+都已经由反向代理覆盖。
 
 ### 安卓壳做了什么
 

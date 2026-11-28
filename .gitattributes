@@ -1,0 +1,9 @@
+# 换行：Windows 脚本必须始终是 CRLF。
+# cmd.exe 解析 .bat 时按 CRLF 认行；纯 LF 下 goto/label 会失效，
+# 表现是“脚本跑到一半就退出”。仓库里存 LF、检出后不转回 CRLF 就会踩到。
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# 其余文本走自动换行
+* text=auto

@@ -168,7 +168,7 @@ fn status_reports_version_and_dirs() {
     let s = start(true);
     let resp = ureq::get(&s.url("/local/status")).call().expect("status");
     let body: serde_json::Value = resp.into_json().expect("json");
-    assert_eq!(body["version"], "0.2.3");
+    assert_eq!(body["version"], "0.2.4");
     assert_eq!(body["port"], s.port);
     assert!(body["dataDir"].as_str().unwrap().contains("data"));
     assert!(body["platform"].is_string());
@@ -845,4 +845,63 @@ fn serves_embedded_ui_without_www_dir() {
     // 带扩展名且不存在 → 仍然 404（不能变成白屏）
     let code = status(ureq::get(&s.url("/nope.js")).call());
     assert_eq!(code, 404, "未知静态资源应 404，实际 {code}");
+}
+
+/// 诊断链路：前端上报 → 写进 app.log → /local/status 能读回来。
+///
+/// 这条链路的价值不在“能记录”，而在把静默失败变成可见失败。
+/// 坏了的话界面上就只剩“不行”，开发者只能猜。
+#[test]
+fn client_log_reaches_status() {
+    let s = start(true);
+
+    // 上报一条。刻意用“不像 JSON”的内容：服务端不应依赖 JSON 解析。
+    let code = status(
+        ureq::post(&s.url("/local/log"))
+            .set("Content-Type", "text/plain")
+            .send_string("POST /local/sync/now -> HTTP 400 boom"),
+    );
+    assert_eq!(code, 200, "上报接口应回 200，实际 {code}");
+
+    // status 里应该能读到刚写进去的那行。
+    let st: serde_json::Value = ureq::get(&s.url("/local/status"))
+        .call()
+        .expect("status")
+        .into_json()
+        .expect("json");
+    let log = st["log"].as_array().expect("status.log 必须是数组");
+    let joined: String = log
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("HTTP 400 boom"),
+        "上报的内容没进 status.log：{joined}"
+    );
+    assert!(
+        joined.contains("[client]"),
+        "上报应带 [client] 标记，便于和 4xx 区分：{joined}"
+    );
+
+    // 服务端自己的 4xx 也要落进去（不是只有前端上报）。
+    let _ = ureq::put(&s.url("/db/session/mismatch"))
+        .set("Content-Type", "application/json")
+        .send_string(r#"{"id":"other","title":"x","messages":[]}"#);
+    let st2: serde_json::Value = ureq::get(&s.url("/local/status"))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    let joined2: String = st2["log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined2.contains("500 PUT /db/session/mismatch"),
+        "服务端 4xx/5xx 应自动落日志：{joined2}"
+    );
 }

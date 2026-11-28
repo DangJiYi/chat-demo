@@ -174,6 +174,7 @@ POST   /local/pair/reject       拒绝
 POST   /local/archive/now       立即归档 + 去重
 POST   /local/images/now        重压缩旧 PNG
 GET    /local/orphans           无人引用的附件（只统计）
+POST   /local/log               前端上报错误 → app.log（不解析 JSON）
 GET    /db/summaries            会话摘要（按 updatedAt 倒序）
 GET    /db/session/<id>         读会话原文
 PUT    /db/session/<id>         存会话（校验 id 一致）

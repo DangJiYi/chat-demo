@@ -1,8 +1,13 @@
 name: build
 
+# 历史工作流。**仅在手动触发时运行。**
+#
+# 以前它也监听 v* tag，结果推一个 tag 会同时跑两套：
+#   - rust-build：Rust 的 Windows exe + Android APK（现在的主流水线）
+#   - 本文件的 windows：旧的 Python PyInstaller exe（已不发布）
+# 白烧一轮 CI，还会在两个 artifact 里选错产物。所以去掉 tag 触发。
+# 确认无用后整个文件可以删掉。
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:

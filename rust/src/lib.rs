@@ -34,7 +34,7 @@ use store::Store;
 
 /// 版本号。**改功能就递增**：排查时靠它确认对方装的到底是哪个构建，
 /// 不然「改了但没生效」和「根本没改」看起来一模一样。
-pub const VERSION: &str = "0.2.3";
+pub const VERSION: &str = "0.2.4";
 
 /// 启动参数。字段都是「跑起来要什么」，与命令行/安卓无关。
 pub struct Options {
@@ -62,6 +62,9 @@ pub fn serve(opts: Options) -> Result<(), String> {
         .map_err(|e| format!("无法初始化数据目录 {}: {e}", opts.data_dir))?;
     // 存活期与进程相同：后台线程和每个请求处理都要用
     let store: &'static Store = Box::leak(Box::new(store));
+
+    // 让 applog 能在没有 Store 的地方写日志（HTTP 4xx、前端上报）。
+    applog::init(store.dir());
 
     // ---- UI 端口：IPv4 必须有，IPv6 尽力而为 ----
     //

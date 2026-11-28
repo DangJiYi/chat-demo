@@ -102,6 +102,8 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
 
   /** 未使用附件（只显示，不自动清） */
   const [orphans, setOrphans] = useState<OrphanMedia | null>(null)
+  // 运行日志（服务端 data/app.log 的尾部）。轮询 status 时一起拿回来。
+  const [logLines, setLogLines] = useState<string[]>([])
 
   const [query, setQuery] = useState('')
   const [hits, setHits] = useState<SearchHit[] | null>(null)
@@ -228,6 +230,9 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
       setSyncPort(dev.syncPort ?? 8791)
       setDeviceName(c.deviceName ?? '')
       setPortDraft(String(dev.syncPort ?? 8791))
+      // 只取日志数组。不要用整个 status 当指纹：里面的 uptimeSec 每次都变，
+      // 会让面板每 4 秒白重绘一次，把正在看的日志滚动位置重置掉。
+      setLogLines(dev.log ?? [])
       const split = splitPeer(c.peer)
       setHost(split.host)
       setPort(split.port)
@@ -642,6 +647,55 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
               {groups.length === 0 && <p className={styles.hint}>没有命中，换个词试试</p>}
             </>
           )}
+        </section>
+
+        {/* ---------- 运行日志 ---------- */}
+        {/*
+          把静默失败变成可见失败的入口。点按钮没反应、界面报错但控制台干净时，
+          先看这里：接口 4xx、前端 JS 异常、未处理的 Promise 拒绝都会落进来。
+        */}
+        <section className={styles.section}>
+          <h3 className={styles.h}>运行日志</h3>
+          <p className={styles.hint}>
+            接口拒绝、前端异常、同步出错都在这里（最近 40 行，每 4 秒自动刷新）。
+          </p>
+          {logLines.length > 0 ? (
+            <pre
+              style={{
+                maxHeight: 220,
+                overflow: 'auto',
+                margin: '8px 0 0',
+                padding: 10,
+                borderRadius: 8,
+                background: 'rgba(127,127,127,0.10)',
+                fontSize: 12,
+                lineHeight: 1.6,
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-all',
+                userSelect: 'text',
+              }}
+            >
+              {logLines.join('\n')}
+            </pre>
+          ) : (
+            <p className={styles.hint}>暂无日志。</p>
+          )}
+          <div className={styles.fieldRow} style={{ marginTop: 8 }}>
+            <Button variant="outlined" onClick={() => void refresh()}>
+              刷新
+            </Button>
+            <Button
+              variant="outlined"
+              onClick={() => {
+                // 复制到剪贴板，便于直接贴给别人看
+                const text = logLines.join('\n')
+                if (!text) return
+                void navigator.clipboard?.writeText(text).catch(() => {})
+              }}
+            >
+              复制
+            </Button>
+          </div>
         </section>
 
         {/* ---------- 归档清单 ---------- */}
