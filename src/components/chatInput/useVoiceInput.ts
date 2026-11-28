@@ -4,6 +4,7 @@ import { transcribe } from '../../services/api/speech.js'
 import { startRecording, type Recording } from '../../services/speech/recorder.js'
 import { useSettings } from '../../services/settings.js'
 import { showToast } from '../base/toastState.js'
+import { reportError } from '../../local/diagnostics.js'
 
 export type VoiceInputStatus = 'idle' | 'recording' | 'transcribing'
 
@@ -84,7 +85,13 @@ export const useVoiceInput = (onText: (text: string) => void) => {
       } else {
         showToast({ key: 'voiceInputEmpty' })
       }
-    } catch {
+    } catch (error) {
+      // 转写失败也一样要留痕：否则“录了但没出字”在日志里看不到任何线索。
+      if (!controller?.signal.aborted) {
+        const name = error instanceof Error ? error.name : typeof error
+        const message = error instanceof Error ? error.message : String(error)
+        reportError('transcribe', `${name}: ${message}`)
+      }
       if (operationRef.current === operation && !controller?.signal.aborted) {
         showToast({ key: 'voiceInputFailed' })
       }
@@ -123,6 +130,13 @@ export const useVoiceInput = (onText: (text: string) => void) => {
       }
       recordingRef.current = recording
     } catch (error) {
+      // 这里必须上报：录音失败被本函数的 catch 收下，只会弹一个 toast，
+      // 永远到不了 window.onerror，所以“点了没反应”时日志里什么都没有。
+      // 把 name/message 写进日志，才能区分是权限被拒、没有设备、
+      // 还是 AudioContext 采样率不支持——三者的修法完全不同。
+      const name = error instanceof Error ? error.name : typeof error
+      const message = error instanceof Error ? error.message : String(error)
+      reportError('startRecording', `${name}: ${message}`)
       if (operationRef.current === operation) {
         setStatus('idle')
         showToast(describeRecordingError(error))

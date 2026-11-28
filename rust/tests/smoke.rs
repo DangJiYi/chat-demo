@@ -168,7 +168,7 @@ fn status_reports_version_and_dirs() {
     let s = start(true);
     let resp = ureq::get(&s.url("/local/status")).call().expect("status");
     let body: serde_json::Value = resp.into_json().expect("json");
-    assert_eq!(body["version"], "0.2.5");
+    assert_eq!(body["version"], "0.2.6");
     assert_eq!(body["port"], s.port);
     assert!(body["dataDir"].as_str().unwrap().contains("data"));
     assert!(body["platform"].is_string());

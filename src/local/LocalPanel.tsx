@@ -104,6 +104,10 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
   const [orphans, setOrphans] = useState<OrphanMedia | null>(null)
   // 运行日志（服务端 data/app.log 的尾部）。轮询 status 时一起拿回来。
   const [logLines, setLogLines] = useState<string[]>([])
+  // 服务端版本（/local/status 的 version）。
+  // 面板里直接显示它，用来回答一个很具体的问题：“手机上跑的是哪个构建？”
+  // 以前只能去看 app.log 或系统设置，两者都不可靠（前者要滚日志，后者是 APK 版本）。
+  const [serviceVersion, setServiceVersion] = useState('')
 
   const [query, setQuery] = useState('')
   const [hits, setHits] = useState<SearchHit[] | null>(null)
@@ -228,6 +232,7 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
       setArchived(ar)
       setLocalIp(dev.localIps?.[0] ?? '')
       setSyncPort(dev.syncPort ?? 8791)
+      setServiceVersion(dev.version ?? '')
       setDeviceName(c.deviceName ?? '')
       setPortDraft(String(dev.syncPort ?? 8791))
       // 只取日志数组。不要用整个 status 当指纹：里面的 uptimeSec 每次都变，
@@ -655,9 +660,17 @@ export const LocalPanel = ({ onClose }: { onClose: () => void }) => {
           先看这里：接口 4xx、前端 JS 异常、未处理的 Promise 拒绝都会落进来。
         */}
         <section className={styles.section}>
-          <h3 className={styles.h}>运行日志</h3>
+          <h3 className={styles.h}>
+            运行日志
+            {serviceVersion ? (
+              <span style={{ fontWeight: 400, opacity: 0.6, marginLeft: 8 }}>
+                v{serviceVersion}
+              </span>
+            ) : null}
+          </h3>
           <p className={styles.hint}>
-            接口拒绝、前端异常、同步出错都在这里（最近 40 行，每 4 秒自动刷新）。
+            接口拒绝、前端异常、录音失败都在这里（最近 40 行，每 4 秒自动刷新）。
+            上方的 vX.Y.Z 是后端版本，用来确认装的是哪个构建。
           </p>
           {logLines.length > 0 ? (
             <pre

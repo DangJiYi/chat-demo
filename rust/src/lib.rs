@@ -34,7 +34,7 @@ use store::Store;
 
 /// 版本号。**改功能就递增**：排查时靠它确认对方装的到底是哪个构建，
 /// 不然「改了但没生效」和「根本没改」看起来一模一样。
-pub const VERSION: &str = "0.2.5";
+pub const VERSION: &str = "0.2.6";
 
 /// 启动参数。字段都是「跑起来要什么」，与命令行/安卓无关。
 pub struct Options {
