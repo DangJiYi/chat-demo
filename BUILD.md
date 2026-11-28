@@ -393,9 +393,26 @@ on:
 要发版就打 tag（版本号会取 tag 名）：
 
 ```bat
-git tag v0.2.4
-git push origin v0.2.4
+git tag v0.2.6
+git push origin v0.2.6
 ```
+
+#### 版本号只有一个地方要改
+
+**真相源是 `rust/Cargo.toml` 的 `[package] version`。**
+
+| 位置 | 怎么拿到版本 |
+| :--- | :--- |
+| `rust/src/lib.rs` 的 `VERSION` | `env!("CARGO_PKG_VERSION")` → 编译期从 Cargo.toml 注入 |
+| `tests/smoke.rs` 的断言 | 同上，不会因为升版先红一轮 |
+| CI 的 APK `versionName` | 从 `rust/Cargo.toml` grep，再加时间戳 |
+| `android/app/build.gradle` | 仅作本地构建的兜底值（CI 会覆盖） |
+
+以前这三处各写一个字面量，结果是：CI 硬编码 `0.2.4`，
+通过 `-PversionName` **覆盖**了 gradle 的值，APK 永远显示 `0.2.4-时间戳`，
+而后端早就是 0.2.6。排查时看到 2.4 会以为“改动没生效”，白费很多时间。
+
+现在升版本：改 `rust/Cargo.toml` 一行 → 三处自动一致。
 
 ### 官方发新版本时
 

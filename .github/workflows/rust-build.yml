@@ -456,10 +456,24 @@ jobs:
         id: v
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            echo "name=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            # 推 tag 时以 tag 名为准（发版场景）
+            VERSION="${GITHUB_REF_NAME#v}"
           else
-            echo "name=0.2.4-$(date -u +%Y%m%d%H%M)" >> "$GITHUB_OUTPUT"
+            # 从 rust/Cargo.toml 的 [package] version 读——那是唯一真相源。
+            #
+            # 以前这里写死 0.2.4，并通过 -PversionName 覆盖了 build.gradle 的值，
+            # 于是 APK 永远显示 0.2.4-时间戳，而 Rust 早就是 0.2.6。
+            # 那个不一致极容易让人误判成“改动没生效”，排查多花了很多时间。
+            VERSION=$(grep -m1 '^version' rust/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+            if [[ -z "$VERSION" ]]; then
+              echo "::error::无法从 rust/Cargo.toml 读取 version"
+              exit 1
+            fi
+            # 加时间戳便于区分同一版本的不同构建
+            VERSION="${VERSION}-$(date -u +%Y%m%d%H%M)"
           fi
+          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "APK versionName: $VERSION"
 
       - name: Build APK
         working-directory: android

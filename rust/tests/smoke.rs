@@ -168,7 +168,9 @@ fn status_reports_version_and_dirs() {
     let s = start(true);
     let resp = ureq::get(&s.url("/local/status")).call().expect("status");
     let body: serde_json::Value = resp.into_json().expect("json");
-    assert_eq!(body["version"], "0.2.6");
+    // 用 env! 而不是写死版本号：断言跟 Cargo.toml 走，升版时不会因为
+    // “测试先红一轮”而白白多推一次 CI。
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["port"], s.port);
     assert!(body["dataDir"].as_str().unwrap().contains("data"));
     assert!(body["platform"].is_string());

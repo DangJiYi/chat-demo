@@ -1,6 +1,13 @@
 [package]
 name = "dsh-chat-server"
-version = "0.1.0"
+# 版本号的**唯一真相源**。
+#
+# rust/src/lib.rs 的 VERSION 用 env!("CARGO_PKG_VERSION") 读它，
+# CI 也从这里读去生成 APK 的 versionName。
+# 以前这个字段停在 0.1.0，lib.rs 另写一个、CI 再硬编码一个，
+# 三处各说各话——APK 版本永远显示 0.2.4，排查时很容易误判“改动没生效”。
+# 升版本只改这一行。
+version = "0.2.6"
 edition = "2021"
 description = "dsh-chat 本地服务（Rust 重写，逐步替代 server.py）"
 

@@ -32,9 +32,13 @@ use tiny_http::Server;
 
 use store::Store;
 
-/// 版本号。**改功能就递增**：排查时靠它确认对方装的到底是哪个构建，
-/// 不然「改了但没生效」和「根本没改」看起来一模一样。
-pub const VERSION: &str = "0.2.6";
+/// 版本号。
+///
+/// **从 `Cargo.toml` 的 `version` 读，不要在这里写死。**
+/// 以前这里是字面量，`Cargo.toml` 另写一个、CI 再硬编码一个，
+/// 三处各说各话：APK 版本永远显示 0.2.4，而后端早已是 0.2.6，
+/// 排查时极易误判成“改动没生效”。现在升版本只需改 `Cargo.toml` 一行。
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 启动参数。字段都是「跑起来要什么」，与命令行/安卓无关。
 pub struct Options {
