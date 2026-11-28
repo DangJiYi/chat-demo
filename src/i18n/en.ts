@@ -162,6 +162,11 @@ export const en = {
   voiceInputPermissionDenied:
     'Microphone access is blocked. Please allow it in your browser settings.',
   voiceInputNoDevice: 'No microphone detected',
+  // NotReadableError: permission is granted and a device exists, but the
+  // audio source cannot start. On Android this usually means another app
+  // (or the system voice assistant) is holding the microphone.
+  voiceInputBusy:
+    'Microphone is unavailable right now, likely in use by another app. Close recording or call apps and try again',
   voiceInputTooLong: 'Recording is too long. Please shorten it and try again.',
   voiceInputFailed: 'Speech recognition failed. Please try again later.',
   voiceInputEmpty: 'No speech detected',

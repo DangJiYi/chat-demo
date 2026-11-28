@@ -22,6 +22,11 @@ const describeRecordingError = (error: unknown): TranslationMessage => {
     if (error.name === 'NotFoundError') {
       return { key: 'voiceInputNoDevice' }
     }
+    // NotReadableError：权限已给、设备也在，但音频源起不来。
+    // 单独给它一条文案，否则用户只能看到“失败”，不知道该去关掉什么。
+    if (error.name === 'NotReadableError') {
+      return { key: 'voiceInputBusy' }
+    }
   }
   return { key: 'voiceInputFailed' }
 }
@@ -37,6 +42,13 @@ export const useVoiceInput = (onText: (text: string) => void) => {
   const recordingRef = useRef<Recording | null>(null)
   const controllerRef = useRef<AbortController | null>(null)
   const operationRef = useRef(0)
+  // 是否有一个 getUserMedia 还在进行中（已点开始、麦克风还没真正打开）。
+  //
+  // 没有这个标记时，连点两下会同时发起两次 getUserMedia，安卓上第二次
+  // 必然失败——同一个麦克风不能被同一页面开两路，报的就是
+  // `NotReadableError: Could not start audio source`。
+  // 之前日志里连着两条一模一样的错误，正是这个竞态。
+  const startingRef = useRef(false)
   const onTextRef = useRef(onText)
   onTextRef.current = onText
 
@@ -46,6 +58,9 @@ export const useVoiceInput = (onText: (text: string) => void) => {
     recordingRef.current = null
     controllerRef.current?.abort()
     controllerRef.current = null
+    // 这里**不**清 startingRef：getUserMedia 还在飞，清了它就可能再发一路，
+    // 又回到“两路麦克风互相挤”的老问题。由 toggle 里 await 的两条分支
+    // （成功/失败）负责清。
   }, [])
 
   const cancel = useCallback(() => {
@@ -115,7 +130,16 @@ export const useVoiceInput = (onText: (text: string) => void) => {
       cancel()
       return
     }
+    // 麦克风还在打开中：这一下不做任何事，等它落定。
+    //
+    // 同一页面不能同时开两路麦克风，安卓上第二次会直接报
+    // NotReadableError: Could not start audio source。
+    // 连点时用户看到的“闪一下就没了”就是这个。
+    if (startingRef.current) {
+      return
+    }
     const operation = ++operationRef.current
+    startingRef.current = true
     setStatus('recording')
     try {
       const recording = await startRecording(() => {
@@ -124,12 +148,14 @@ export const useVoiceInput = (onText: (text: string) => void) => {
           void finish()
         }
       })
+      startingRef.current = false
       if (operationRef.current !== operation) {
         recording.cancel()
         return
       }
       recordingRef.current = recording
     } catch (error) {
+      startingRef.current = false
       // 这里必须上报：录音失败被本函数的 catch 收下，只会弹一个 toast，
       // 永远到不了 window.onerror，所以“点了没反应”时日志里什么都没有。
       // 把 name/message 写进日志，才能区分是权限被拒、没有设备、

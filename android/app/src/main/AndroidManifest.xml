@@ -6,6 +6,11 @@
     <!-- 语音输入：WebView 的 getUserMedia 同时需要这条系统权限
          和 WebChromeClient.onPermissionRequest 放行，少一个就是“点了没反应”。 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- required=false：没有麦克风的设备也要能装（只是语音输入不可用）。
+         写上这条是为了让 ROM 正确识别本应用需要音频输入路径，
+         否则个别 ROM（含 MIUI）下 WebView 的 getUserMedia 会直接报
+         NotReadableError: Could not start audio source。 -->
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
     <application
         android:allowBackup="false"

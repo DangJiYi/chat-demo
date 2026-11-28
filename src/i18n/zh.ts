@@ -153,6 +153,9 @@ export const zh = {
   voiceInputCancel: '正在转写，点击取消',
   voiceInputPermissionDenied: '无法使用麦克风，请在浏览器设置中允许访问',
   voiceInputNoDevice: '未检测到麦克风',
+  // NotReadableError：权限已给、设备也在，但音频源起不来。
+  // 安卓上通常是麦克风被别的应用（或系统语音助手）占着。
+  voiceInputBusy: '麦克风暂时无法启动，可能被其他应用占用。请关闭录音/通话类应用后重试',
   voiceInputTooLong: '录音过长，请缩短后重试',
   voiceInputFailed: '语音识别失败，请稍后再试',
   voiceInputEmpty: '未识别到语音内容',

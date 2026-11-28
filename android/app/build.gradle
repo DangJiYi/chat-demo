@@ -17,9 +17,9 @@ android {
         applicationId 'com.dangjiyi.dshchat'
         minSdk 24
         targetSdk 34
-        versionCode 26
+        versionCode 27
         // CI 里用 -PversionName=v0.2.x 注入；本地构建用默认值
-        versionName (project.findProperty('versionName') ?: '0.2.6')
+        versionName (project.findProperty('versionName') ?: '0.2.7')
 
         // 只出 arm64-v8a。
         // 2020 年后的安卓手机基本都是 arm64；要兼容 32 位老机器就加 'armeabi-v7a'

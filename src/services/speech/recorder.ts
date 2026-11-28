@@ -41,11 +41,33 @@ const createContext = (): AudioContext => {
   }
 }
 
+/**
+ * 打开麦克风，失败时重试一次。
+ *
+ * `NotReadableError`（Could not start audio source）在安卓上很常见的原因是
+ * 上一路录音刚被 stop，设备还没真正释放；等一小下再开就好了。
+ * 如果是其他应用在占麦克风，重试也会失败，所以只重试一次、只针对这一个错误，
+ * 避免把“真的用不了”拖成慢失败。
+ */
+const openMicrophone = async (): Promise<MediaStream> => {
+  const constraints: MediaStreamConstraints = {
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+  }
+  try {
+    return await navigator.mediaDevices.getUserMedia(constraints)
+  } catch (error) {
+    const notReadable = error instanceof Error && error.name === 'NotReadableError'
+    if (!notReadable) {
+      throw error
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    return navigator.mediaDevices.getUserMedia(constraints)
+  }
+}
+
 /** 开始录音；到达时长上限时调用 onLimit，由调用方决定何时 stop */
 export const startRecording = async (onLimit: () => void): Promise<Recording> => {
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-  })
+  const stream = await openMicrophone()
   let context: AudioContext | undefined
   let source: MediaStreamAudioSourceNode | undefined
   let processor: ScriptProcessorNode | undefined
